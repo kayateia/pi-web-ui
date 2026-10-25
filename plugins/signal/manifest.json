@@ -1,0 +1,50 @@
+{
+	"apiVersion": 2,
+	"name": "signal",
+	"nameEn": "Signal",
+	"version": "0.1.0",
+	"description": "Signal 全账号网关：私聊与群组路由、发送者白名单、每频道系统提示词与独立 pi-web-ui 会话",
+	"descriptionEn": "Full Signal account gateway with DM/group routing, sender allowlists, per-channel prompts, and isolated pi-web-ui conversations.",
+	"author": "pi-web-ui",
+	"homepage": "https://github.com/xing-shuyin/pi-web-ui/tree/main/plugins/signal",
+	"icon": "🔐",
+	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z\"/><path d=\"M9.5 12.5l1.8 1.8 3.7-4\"/></svg>",
+	"server": "index.mjs",
+	"client": "client/entry.mjs",
+	"permissions": ["ui", "chat", "notify", "storage"],
+	"ui": {
+		"views": [
+			{
+				"id": "signal",
+				"label": "Signal",
+				"icon": "🔐"
+			}
+		],
+		"topbar": [
+			{
+				"id": "signal-open",
+				"label": "Signal",
+				"icon": "🔐",
+				"action": { "type": "view", "viewId": "signal" },
+				"order": 64
+			}
+		],
+		"statusBar": [
+			{
+				"id": "signal-status",
+				"label": "🔐 Signal",
+				"title": "Open the Signal gateway",
+				"action": { "type": "view", "viewId": "signal" },
+				"order": 54
+			}
+		],
+		"commands": [
+			{
+				"id": "open",
+				"label": "Open Signal gateway",
+				"icon": "🔐",
+				"action": { "type": "view", "viewId": "signal" }
+			}
+		]
+	}
+}
