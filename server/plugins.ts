@@ -264,7 +264,56 @@ export interface PluginConversationListItem {
 	cwd: string;
 	kind: string;
 	isStreaming: boolean;
+	/** Persisted Pi session file, when the conversation has one.
+	 *  Transport plugins use this as the stable identity across restarts. */
+	sessionFile?: string;
 }
+
+/**
+ * Create or reopen a background conversation owned by a transport plugin.
+ *
+ * `key` is stable within one plugin (for example a Signal group ID). Reusing
+ * the key returns the same live conversation without changing the user's
+ * active chat. Supply `sessionFile` after a restart to reopen the persisted
+ * transcript instead of creating a new one.
+ */
+export interface PluginConversationEnsureRequest {
+	/** Stable, plugin-scoped identity such as `group:<id>` or `dm:<aci>`. */
+	key: string;
+	/** Human-readable title shown in the running-conversation list. */
+	title?: string;
+	/** Workspace for this conversation. Defaults to the host's current cwd. */
+	cwd?: string;
+	/** Existing pi-web-ui agent preset id. */
+	preset?: string;
+	/** Channel-specific system prompt. */
+	systemPrompt?: string;
+	/** `append` preserves the normal pi-web-ui prompt; `replace` substitutes it. */
+	systemPromptMode?: "append" | "replace";
+	/** Optional skill/include allowlists for this conversation profile. */
+	enabledSkills?: string[];
+	enabledExtensions?: string[];
+	/** Persisted Pi session file from a previous process. */
+	sessionFile?: string;
+	/** Provider/model id, using `provider/model-id`. */
+	model?: string;
+	/** SDK thinking level such as `off`, `low`, `medium`, or `high`. */
+	thinkingLevel?: string;
+}
+
+/** Result of host.conversations.ensure(). */
+export interface PluginConversationEnsureResult {
+	ok: boolean;
+	conversationId?: string;
+	sessionFile?: string;
+	error?: string;
+}
+
+/** PluginManager conversation creation hook injected by server/index.ts. */
+export type PluginConversationEnsurer = (
+	pluginId: string,
+	request: PluginConversationEnsureRequest,
+) => Promise<PluginConversationEnsureResult>;
 
 /** 插件注册的内联状态标记（Inline Marker）。 */
 export interface PluginMarkerDef<State = unknown> {
@@ -485,6 +534,9 @@ export interface PluginHost {
 			query: string,
 			limit?: number,
 		): Array<{ id: string; title: string }> | Promise<Array<{ id: string; title: string }>>;
+		/** Create or reopen a visible background conversation by stable key.
+		 *  This never switches the browser's active conversation. */
+		ensure(request: PluginConversationEnsureRequest): Promise<PluginConversationEnsureResult>;
 	};
 	/** 向指定对话发一条用户消息（经 conversationWriter 注入点；无注入回
 	 *  {ok:false}，绝不抛错）。attachments 只收工作区路径三件套。 */
@@ -2509,6 +2561,9 @@ export class PluginManager {
 				limit?: number,
 		  ) => Array<{ id: string; title: string }> | Promise<Array<{ id: string; title: string }>>)
 		| undefined = undefined;
+	/** 由 index.ts 接入 agent-service：创建/复用后台对话（host.conversations.ensure 的底层）。
+	 *  无注入回 {ok:false}，绝不抛错。 */
+	conversationEnsurer: PluginConversationEnsurer | undefined = undefined;
 	/** 由 index.ts 接入 agent-service：向指定对话发用户消息（host.prompt 的底层）。
 	 *  无注入回 {ok:false}，绝不抛错。 */
 	conversationWriter:
@@ -4239,6 +4294,50 @@ export class PluginManager {
 						return pick(all ?? []);
 					} catch {
 						return [];
+					}
+				},
+				ensure: async (request) => {
+					try {
+						if (!can("chat")) return { ok: false, error: `插件未声明能力 "chat"（manifest.permissions）——请求被拒` };
+						if (!self.conversationEnsurer) {
+							return { ok: false, error: "宿主未接入对话创建（仅标准 pi 引擎支持）" };
+						}
+						const key = String(request?.key ?? "").trim();
+						if (!key) return { ok: false, error: "conversation key 不能为空" };
+						if (key.length > 160) return { ok: false, error: "conversation key 过长（>160 字）" };
+						const title =
+							typeof request?.title === "string" && request.title.trim()
+								? request.title.trim().slice(0, 160)
+								: undefined;
+						const prompt =
+							typeof request?.systemPrompt === "string" ? request.systemPrompt.slice(0, 32_768) : undefined;
+						const settings = Array.isArray(request?.enabledSkills) ? request.enabledSkills.slice(0, 64) : undefined;
+						const extensions = Array.isArray(request?.enabledExtensions)
+							? request.enabledExtensions.slice(0, 64)
+							: undefined;
+						return await self.conversationEnsurer(info.id, {
+							key,
+							...(title ? { title } : {}),
+							...(typeof request?.cwd === "string" && request.cwd.trim() ? { cwd: request.cwd.trim() } : {}),
+							...(typeof request?.preset === "string" && request.preset.trim()
+								? { preset: request.preset.trim() }
+								: {}),
+							...(prompt !== undefined ? { systemPrompt: prompt } : {}),
+							...(request?.systemPromptMode === "replace"
+								? { systemPromptMode: "replace" }
+								: { systemPromptMode: "append" }),
+							...(settings ? { enabledSkills: settings.filter((v) => typeof v === "string") } : {}),
+							...(extensions ? { enabledExtensions: extensions.filter((v) => typeof v === "string") } : {}),
+							...(typeof request?.sessionFile === "string" && request.sessionFile.trim()
+								? { sessionFile: request.sessionFile.trim() }
+								: {}),
+							...(typeof request?.model === "string" && request.model.trim() ? { model: request.model.trim() } : {}),
+							...(typeof request?.thinkingLevel === "string" && request.thinkingLevel.trim()
+								? { thinkingLevel: request.thinkingLevel.trim() }
+								: {}),
+						});
+					} catch (err) {
+						return { ok: false, error: (err as Error).message };
 					}
 				},
 			},

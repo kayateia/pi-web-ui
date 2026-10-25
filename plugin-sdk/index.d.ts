@@ -166,6 +166,28 @@ export interface PluginHostLlm {
 	}>;
 }
 
+/** Create/reopen a visible background conversation owned by a transport plugin. */
+export interface PluginConversationEnsureRequest {
+	key: string;
+	title?: string;
+	cwd?: string;
+	preset?: string;
+	systemPrompt?: string;
+	systemPromptMode?: "append" | "replace";
+	enabledSkills?: string[];
+	enabledExtensions?: string[];
+	sessionFile?: string;
+	model?: string;
+	thinkingLevel?: string;
+}
+
+export interface PluginConversationEnsureResult {
+	ok: boolean;
+	conversationId?: string;
+	sessionFile?: string;
+	error?: string;
+}
+
 /** 工具拦截守卫看到的 pre 请求（只对 bash/read 生效，全量见 server/plugin-tool-guard.ts）。 */
 export interface ToolGuardPreRequest {
 	toolName: "bash" | "read";
@@ -320,6 +342,9 @@ export interface PluginHost {
 			query: string,
 			limit?: number,
 		): Array<{ id: string; title: string }> | Promise<Array<{ id: string; title: string }>>;
+		/** Create or reopen a visible background conversation by stable key.
+		 *  Does not switch away from the browser's active chat. */
+		ensure(request: PluginConversationEnsureRequest): Promise<PluginConversationEnsureResult>;
 	};
 	/** 向指定对话发一条用户消息（无注入回 {ok:false}，绝不抛错）。 */
 	prompt(

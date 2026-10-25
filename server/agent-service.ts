@@ -100,6 +100,8 @@ import {
 import type {
 	PluginAgentTool,
 	PluginCommandDef,
+	PluginConversationEnsureRequest,
+	PluginConversationEnsureResult,
 	PluginConversationSnapshot,
 	PluginRunEvent,
 	PluginToolEvent,
@@ -826,6 +828,10 @@ export class ClientSession {
 	private convs = new Map<string, Conversation>();
 	private activeId = "";
 	private convSeq = 0;
+	/** Stable transport-plugin keys mapped to background conversations. The
+	 *  concrete session file remains the durable identity; this map only avoids
+	 *  duplicate runtimes while the process is alive. */
+	private pluginConversations = new Map<string, { conversationId: string; template: SubagentTemplate }>();
 	/** 模型变更事件（#542）已发过的去重键：convId → `modelChangeKey(snap)`。重连重放
 	 *  同一个 set_model、或重复点同一个模型，不会重复触发插件订阅者。 */
 	private pluginModelKeys = new Map<string, string>();
@@ -4471,8 +4477,22 @@ export class ClientSession {
 	/** 插件扩展点 v2（只读组装，供 index.ts 注入给 PluginManager 的 conversationLister）。
 	 *  本客户端运行中对话（kind:"running"）+ 当前项目历史会话摘要（kind:"history"，最多 50 条）。
 	 *  纯数据组装，不 emit、不改任何状态；历史会话读失败时只回运行中部分。 */
-	listRunningForPlugins(): { id: string; title: string; cwd: string; kind: "running"; isStreaming: boolean }[] {
-		const out: { id: string; title: string; cwd: string; kind: "running"; isStreaming: boolean }[] = [];
+	listRunningForPlugins(): {
+		id: string;
+		title: string;
+		cwd: string;
+		kind: "running";
+		isStreaming: boolean;
+		sessionFile?: string;
+	}[] {
+		const out: {
+			id: string;
+			title: string;
+			cwd: string;
+			kind: "running";
+			isStreaming: boolean;
+			sessionFile?: string;
+		}[] = [];
 		for (const conv of this.convs.values()) {
 			let isStreaming = false;
 			try {
@@ -4480,7 +4500,15 @@ export class ClientSession {
 			} catch {
 				// 会话替换中——按未跑处理
 			}
-			out.push({ id: conv.id, title: conv.title, cwd: conv.cwd, kind: "running", isStreaming });
+			const sessionFile = conv.session.sessionFile;
+			out.push({
+				id: conv.id,
+				title: conv.title,
+				cwd: conv.cwd,
+				kind: "running",
+				isStreaming,
+				...(sessionFile ? { sessionFile } : {}),
+			});
 		}
 		return out;
 	}
@@ -4543,6 +4571,247 @@ export class ClientSession {
 			return { ok: true };
 		} catch (err) {
 			return { ok: false, error: (err as Error).message };
+		}
+	}
+
+	/**
+	 * Create or reopen a visible background conversation for a transport plugin.
+	 *
+	 * The browser's active conversation is deliberately untouched: channel
+	 * conversations run beside the user's work and appear in Running Chats.
+	 * `pluginId + key` is the live dedupe key; `sessionFile` is the durable
+	 * identity supplied by the plugin after its first successful run.
+	 */
+	async ensureConversationForPlugins(
+		pluginId: string,
+		request: PluginConversationEnsureRequest,
+	): Promise<PluginConversationEnsureResult> {
+		try {
+			if (this.quiesceBlocked()) return { ok: false, error: "服务器正在排空，稍后再试" };
+			const safePlugin = String(pluginId ?? "plugin").replace(/[^A-Za-z0-9_-]/g, "") || "plugin";
+			const key = String(request.key ?? "").trim();
+			if (!key) return { ok: false, error: "conversation key 不能为空" };
+			const scopedKey = `${safePlugin}:${key}`;
+			const existing = this.pluginConversations.get(scopedKey);
+			const existingConv = existing ? this.convs.get(existing.conversationId) : undefined;
+			if (existing && existingConv) {
+				const reload = this.applyPluginConversationProfile(existingConv, existing.template, request);
+				if (reload) await existingConv.session.resourceLoader.reload();
+				await this.applyPluginConversationRuntime(existingConv, request);
+				return {
+					ok: true,
+					conversationId: existingConv.id,
+					...(existingConv.session.sessionFile ? { sessionFile: existingConv.session.sessionFile } : {}),
+				};
+			}
+			if (existing) this.pluginConversations.delete(scopedKey);
+
+			const requestedCwd = String(request.cwd ?? "").trim();
+			const cwdCheck = requestedCwd ? checkPluginCwd(requestedCwd) : { ok: true, abs: this.cwd };
+			if (!cwdCheck.ok || !cwdCheck.abs) return { ok: false, error: cwdCheck.error ?? "工作目录无效" };
+			const targetCwd = restoreWorkspaceUriFromSessionDir(cwdCheck.abs);
+
+			const requestedFile = String(request.sessionFile ?? "").trim();
+			if (requestedFile) {
+				const targetPath = resolve(requestedFile);
+				if (!isInsideSessionsDir(this.agentDir, targetPath)) {
+					return { ok: false, error: "只能恢复会话目录中的对话记录" };
+				}
+				const openedHere = [...this.convs.values()].find((conv) => {
+					const file = conv.session.sessionFile;
+					return file && normalizePathKey(file) === normalizePathKey(targetPath);
+				});
+				if (openedHere) {
+					const template = this.makePluginConversationTemplate(request);
+					const reload = this.applyPluginConversationProfile(openedHere, template, request);
+					if (reload) await openedHere.session.resourceLoader.reload();
+					this.pluginConversations.set(scopedKey, {
+						conversationId: openedHere.id,
+						template,
+					});
+					return {
+						ok: true,
+						conversationId: openedHere.id,
+						sessionFile: openedHere.session.sessionFile,
+					};
+				}
+				const owner = this.findSessionOwner?.(targetPath);
+				if (owner) {
+					return {
+						ok: false,
+						error: `该会话正在另一处使用（${owner.clientId}/${owner.convId}）`,
+					};
+				}
+			}
+
+			const openInProject = [...this.convs.values()].filter(
+				(conv) => conv.cwd === targetCwd && !conv.isSubagent && !conv.isEphemeral,
+			).length;
+			const limit = getMaxOpenConversations();
+			if (openInProject >= limit) {
+				return {
+					ok: false,
+					error: `当前项目运行的对话已达上限（${limit} 个），请先移出不需要的对话`,
+				};
+			}
+
+			let sessionManager: SessionManager;
+			if (requestedFile) {
+				const targetPath = resolve(requestedFile);
+				if (!existsSync(targetPath)) return { ok: false, error: `会话文件不存在：${targetPath}` };
+				this.repairTranscriptFileBeforeOpen(targetPath);
+				sessionManager = SessionManager.open(targetPath);
+				calibrateSessionLeaf(sessionManager);
+			} else {
+				sessionManager = SessionManager.create(resolveWorkspaceSessionDir(this.stateStore?.dataDir, targetCwd));
+			}
+
+			const template = this.makePluginConversationTemplate(request);
+			const conversationId = this.nextConversationId();
+			const terminals = this.makeTerminalManager(conversationId, targetCwd);
+			const initialModel = this.resolvePluginModel(request.model);
+			const runtime = await createAgentSessionRuntime(
+				this.makeRuntimeFactory(terminals, template, conversationId, initialModel, request.preset, false),
+				{
+					cwd: targetCwd,
+					agentDir: this.agentDir,
+					sessionManager,
+				},
+			);
+
+			const conv = this.makeConversation(runtime, conversationId, terminals);
+			conv.cwd = targetCwd;
+			conv.listed = true;
+			conv.promptedSinceActive = false;
+			this.applyPluginConversationProfile(conv, template, request);
+			conv.unsubscribe = conv.session.subscribe((event) => this.onEvent(conv, event));
+			this.convs.set(conv.id, conv);
+			this.pluginConversations.set(scopedKey, { conversationId: conv.id, template });
+			this.applySessionOverrides(conv);
+
+			try {
+				await conv.session.bindExtensions({
+					mode: "rpc",
+					uiContext: WebUIContext.headless(),
+					onError: this.makeExtensionErrorReporter({
+						text: `插件通道 ${key}：`,
+						textEn: `Plugin channel ${key}: `,
+					}),
+				});
+			} catch {
+				// Extension binding failure does not make the conversation unusable.
+			}
+
+			await this.applyPluginConversationRuntime(conv, request);
+			this.invalidateSessionInfos();
+			this.emitConversations();
+			this.scheduleSessionsRefresh();
+
+			return {
+				ok: true,
+				conversationId: conv.id,
+				...(conv.session.sessionFile ? { sessionFile: conv.session.sessionFile } : {}),
+			};
+		} catch (err) {
+			return { ok: false, error: (err as Error).message };
+		}
+	}
+
+	/** Build the mutable profile object consumed by makeRuntimeFactory(). */
+	private makePluginConversationTemplate(request: PluginConversationEnsureRequest): SubagentTemplate {
+		return {
+			name: `plugin-channel:${String(request.key ?? "").slice(0, 80)}`,
+			description: "Transport-plugin conversation profile",
+			promptMode: request.systemPromptMode === "replace" ? "replace" : "append",
+			systemPrompt: String(request.systemPrompt ?? ""),
+			enabledSkills: Array.isArray(request.enabledSkills) ? [...request.enabledSkills] : [],
+			enabledExtensions: Array.isArray(request.enabledExtensions) ? [...request.enabledExtensions] : [],
+			model: String(request.model ?? "").trim(),
+			thinkingLevel: String(request.thinkingLevel ?? "").trim(),
+			enabled: true,
+		};
+	}
+
+	/**
+	 * Apply metadata/prompt changes to a plugin conversation. The template
+	 * object is retained by the runtime factory, so prompt changes are visible
+	 * on the next run without rebuilding the session. Skill/extension changes
+	 * require a resource reload, signalled by the boolean return.
+	 */
+	private applyPluginConversationProfile(
+		conv: Conversation,
+		template: SubagentTemplate,
+		request: PluginConversationEnsureRequest,
+	): boolean {
+		const previousSkills = JSON.stringify(template.enabledSkills);
+		const previousExtensions = JSON.stringify(template.enabledExtensions);
+		template.promptMode = request.systemPromptMode === "replace" ? "replace" : "append";
+		template.systemPrompt = String(request.systemPrompt ?? "");
+		template.enabledSkills = Array.isArray(request.enabledSkills) ? [...request.enabledSkills] : [];
+		template.enabledExtensions = Array.isArray(request.enabledExtensions) ? [...request.enabledExtensions] : [];
+		template.model = String(request.model ?? "").trim();
+		template.thinkingLevel = String(request.thinkingLevel ?? "").trim();
+
+		const title = String(request.title ?? "")
+			.replace(/[\u0000-\u001F\u007F]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 160);
+		if (title && title !== conv.title) {
+			conv.title = title;
+			try {
+				conv.session.setSessionName(title);
+			} catch {
+				// Title persistence is best-effort; the conversation remains usable.
+			}
+		}
+
+		const requestedPreset = String(request.preset ?? "").trim();
+		if (requestedPreset) {
+			const preset = PI_AGENT_PRESETS.find((entry) => entry.id === requestedPreset);
+			if (!preset) throw new Error(`未知 agent preset：${requestedPreset}`);
+			if (conv.agentPreset !== preset.id) {
+				conv.agentPreset = preset.id;
+				this.applyToolGating(conv.session, preset.id);
+			}
+		}
+
+		return (
+			previousSkills !== JSON.stringify(template.enabledSkills) ||
+			previousExtensions !== JSON.stringify(template.enabledExtensions)
+		);
+	}
+
+	/** Resolve an explicit plugin model before constructing a runtime. */
+	private resolvePluginModel(modelId: string | undefined): Parameters<AgentSession["setModel"]>[0] | undefined {
+		const requested = String(modelId ?? "").trim();
+		if (!requested) return undefined;
+		const slash = requested.indexOf("/");
+		if (slash <= 0 || slash >= requested.length - 1) {
+			throw new Error(`模型格式应为 provider/model-id：${requested}`);
+		}
+		const model = this.sharedModelRuntime?.getModel(requested.slice(0, slash), requested.slice(slash + 1));
+		if (!model) throw new Error(`模型不存在：${requested}`);
+		return model;
+	}
+
+	/** Apply optional per-conversation model/thinking settings without changing
+	 *  the browser's active conversation. */
+	private async applyPluginConversationRuntime(
+		conv: Conversation,
+		request: PluginConversationEnsureRequest,
+	): Promise<void> {
+		const modelId = String(request.model ?? "").trim();
+		if (modelId) {
+			const model = this.resolvePluginModel(modelId);
+			if (model) {
+				await this.restoreKeyForModel(modelId, conv.cwd);
+				await conv.session.setModel(model);
+			}
+		}
+		const thinking = String(request.thinkingLevel ?? "").trim();
+		if (thinking) {
+			conv.session.setThinkingLevel(thinking as Parameters<AgentSession["setThinkingLevel"]>[0]);
 		}
 	}
 
@@ -10888,6 +11157,9 @@ export class ClientSession {
 			// ignore
 		}
 		this.convs.delete(id);
+		for (const [key, entry] of this.pluginConversations) {
+			if (entry.conversationId === id) this.pluginConversations.delete(key);
+		}
 		conv.suspendedSubagents?.clear();
 		for (const c of this.convs.values()) {
 			c.suspendedSubagents?.delete(conv);
