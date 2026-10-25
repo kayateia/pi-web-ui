@@ -324,14 +324,30 @@ export interface PluginHost {
 	fetch(input: string | URL | Request, init?: RequestInit & { timeoutMs?: number }): Promise<Response>;
 	/** 无头调用：把外部通道文本投给 agent（要 "chat" 能力；宿主未接 chatProvider
 	 *  时 reject（由 chatWait 包成 {ok:false}，插件侧用 chatWait 更省心）。 */
-	chat(req: { text: string; accountId?: string }): Promise<{
+	chat(req: {
+		text: string;
+		accountId?: string;
+		cwd?: string;
+		conversationId?: string;
+		strictConversationId?: boolean;
+		model?: string;
+		thinkingLevel?: string;
+	}): Promise<{
 		ok: boolean;
 		conversationId?: string;
 		error?: string;
 	}>;
 	/** 等待无头调用的运行结束（默认 120s 超时；无注入/超时/失败一律回 {ok:false}，绝不抛错）。 */
 	chatWait(
-		req: { text: string; accountId?: string },
+		req: {
+			text: string;
+			accountId?: string;
+			cwd?: string;
+			conversationId?: string;
+			strictConversationId?: boolean;
+			model?: string;
+			thinkingLevel?: string;
+		},
 		opts?: { timeoutMs?: number },
 	): Promise<{ ok: boolean; conversationId?: string; error?: string }>;
 	/** 对话读写：无注入时 list/search 回 []、get 回 null，绝不抛错。 */

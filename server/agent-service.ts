@@ -149,6 +149,7 @@ import {
 } from "./client-state.js";
 import { isTraditionalLocale, pick, resolveServerLang, type ServerLang } from "./i18n.js";
 import {
+	THINKING_LEVELS,
 	SubagentTemplatesStore,
 	localizeTemplate,
 	pickTemplatePrompt,
@@ -4591,6 +4592,14 @@ export class ClientSession {
 			const safePlugin = String(pluginId ?? "plugin").replace(/[^A-Za-z0-9_-]/g, "") || "plugin";
 			const key = String(request.key ?? "").trim();
 			if (!key) return { ok: false, error: "conversation key 不能为空" };
+			const requestedPreset = String(request.preset ?? "").trim();
+			if (requestedPreset && !PI_AGENT_PRESETS.some((preset) => preset.id === requestedPreset)) {
+				return { ok: false, error: `未知 agent preset：${requestedPreset}` };
+			}
+			const requestedThinking = String(request.thinkingLevel ?? "").trim();
+			if (requestedThinking && !THINKING_LEVELS.includes(requestedThinking as (typeof THINKING_LEVELS)[number])) {
+				return { ok: false, error: `未知 thinking level：${requestedThinking}` };
+			}
 			const scopedKey = `${safePlugin}:${key}`;
 			const existing = this.pluginConversations.get(scopedKey);
 			const existingConv = existing ? this.convs.get(existing.conversationId) : undefined;
@@ -4654,7 +4663,6 @@ export class ClientSession {
 					error: `当前项目运行的对话已达上限（${limit} 个），请先移出不需要的对话`,
 				};
 			}
-
 			let sessionManager: SessionManager;
 			if (requestedFile) {
 				const targetPath = resolve(requestedFile);
@@ -4702,7 +4710,16 @@ export class ClientSession {
 				// Extension binding failure does not make the conversation unusable.
 			}
 
-			await this.applyPluginConversationRuntime(conv, request);
+			try {
+				await this.applyPluginConversationRuntime(conv, request);
+			} catch (err) {
+				this.pluginConversations.delete(scopedKey);
+				this.convs.delete(conv.id);
+				conv.unsubscribe?.();
+				terminals.killAll();
+				await runtime.dispose().catch(() => {});
+				throw err;
+			}
 			this.invalidateSessionInfos();
 			this.emitConversations();
 			this.scheduleSessionsRefresh();

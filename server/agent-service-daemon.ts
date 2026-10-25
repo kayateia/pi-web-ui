@@ -631,7 +631,15 @@ export class AgentService {
 		if (target) {
 			const w = await this.wakeConversation(target, text);
 			if (w.ok) return { conversationId: target, clientId: w.clientId ?? clientId };
+			if (req?.strictConversationId === true) {
+				throw new Error(
+					w.busy
+						? `目标对话正忙，拒绝回落到其他会话：${w.error ?? target}`
+						: `目标对话不可用，拒绝回落到其他会话：${w.error ?? target}`,
+				);
+			}
 		}
+		if (req?.strictConversationId === true) throw new Error("strictConversationId 需要有效的 conversationId");
 		// 2. 工作空间：不传回落伪客户端当前目录；传了必须存在且非系统目录。
 		const cwdReq = String(req?.cwd ?? "").trim();
 		let cwdAbs = "";

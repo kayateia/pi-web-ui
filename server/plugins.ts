@@ -246,6 +246,10 @@ export interface PluginChatRequest {
 	/** 可选：绑定已有会话 ID（命中运行中对话时走 steer 语义投递，网页端实时
 	 *  可见；miss/已回收时回落无头伪客户端执行，不静默丢消息）。 */
 	conversationId?: string;
+	/** Require `conversationId` to resolve exactly; do not fall back to the
+	 *  plugin pseudo-client when it is missing or busy. Transport gateways use
+	 *  this to prevent cross-channel context leaks. */
+	strictConversationId?: boolean;
 	/** 可选：指定模型（`provider/id` 格式，投递前切换，失败即拒绝不回落）。 */
 	model?: string;
 	/** 可选：指定思考强度（投递前切换，失败即拒绝不回落）。 */
@@ -4092,6 +4096,7 @@ export class PluginManager {
 			if (cwd) passthrough.cwd = cwd.slice(0, 1024);
 			const conversationId = String(r.conversationId ?? "").trim();
 			if (conversationId) passthrough.conversationId = conversationId.slice(0, 128);
+			if (r.strictConversationId === true) passthrough.strictConversationId = true;
 			const model = String(r.model ?? "").trim();
 			if (model) passthrough.model = model.slice(0, 256);
 			const thinkingLevel = String(r.thinkingLevel ?? "").trim();
