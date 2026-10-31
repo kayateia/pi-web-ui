@@ -380,6 +380,7 @@ import {
 import type {
 	BgServer,
 	CommandDef,
+	ConversationCategory,
 	ConversationSummary,
 	ElsewhereRunning,
 	GoalStatus,
@@ -685,6 +686,8 @@ export interface Conversation {
 	 *  的 pinned 判据），空闲无终端也不随切换释放；显式 dismiss / 强行关闭才移出。
 	 *  本会话进程内有效，不落盘（重启后按历史重开时不再钉）。 */
 	pinned?: boolean;
+	/** User-defined topical category (absent = Uncategorized). */
+	categoryId?: string;
 	/** A prompt was sent while this conversation was active (cleared whenever
 	 *  it becomes active). A listed conversation that is displaced while idle
 	 *  with this still false counts as "opened but not continued" and is
@@ -4937,6 +4940,12 @@ export class ClientSession {
 			workspaceSnapshots: readWorkspaceSnapshotsFromSession(runtime.session.sessionManager),
 		};
 		conversationIdentity(conv);
+		try {
+			const categoryId = this.stateStore?.getConversationCategoryId(conv.session.sessionId, conv.session.sessionFile);
+			if (categoryId) conv.categoryId = categoryId;
+		} catch {
+			// Session metadata may be unavailable while a runtime is being replaced.
+		}
 		this.restorePlan(conv);
 		return conv;
 	}
@@ -12829,6 +12838,7 @@ export class ClientSession {
 		ephemeral?: boolean,
 		onReady?: (id: string) => void,
 		independent = true,
+		categoryId?: string,
 	): Promise<boolean> {
 		if (this.quiesceBlocked()) return false;
 		// Reuse an already-open blank conversation instead of piling up new ones
@@ -12854,6 +12864,7 @@ export class ClientSession {
 				this.flushSnapshot();
 			}
 			this.setConversationIndependent(active.id, independent);
+			if (categoryId !== undefined) this.applyConversationCategory(active, categoryId);
 			onReady?.(active.id);
 			return true;
 		}
@@ -12865,6 +12876,7 @@ export class ClientSession {
 					if (_preset) await this.selectAgentPreset(_preset);
 					else this.flushSnapshot();
 					this.setConversationIndependent(conv.id, independent);
+					if (categoryId !== undefined) this.applyConversationCategory(conv, categoryId);
 					onReady?.(conv.id);
 					return true;
 				}
@@ -12937,6 +12949,7 @@ export class ClientSession {
 			const conv = this.makeConversation(runtime, conversationId, terminals);
 			conv.cwd = this.cwd;
 			conv.independent = independent;
+			if (categoryId !== undefined) this.applyConversationCategory(conv, categoryId);
 			conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
 			if (ephemeral) conv.isEphemeral = true;
 			if (_preset) {
@@ -13917,6 +13930,7 @@ export class ClientSession {
 					: (conv.subagentTemplate?.model ?? undefined),
 				thinkingLevel: conv.session.thinkingLevel ?? conv.subagentThinking ?? undefined,
 				...(conv.pinned ? { pinned: true as const } : {}),
+				...(conv.categoryId ? { categoryId: conv.categoryId } : {}),
 				...(conv.terminals.countUserBlockingLive() > 0 ? { hasUserTerminals: true as const } : {}),
 				...(conv.forkFrom ? { forkFrom: conv.forkFrom } : {}),
 			});
@@ -14209,6 +14223,10 @@ export class ClientSession {
 					modified: s.modified.getTime(),
 					source: "web",
 					...(isPinned ? { pinned: true } : {}),
+					...(() => {
+						const categoryId = this.stateStore?.getConversationCategoryId(s.id, s.path);
+						return categoryId ? { categoryId } : {};
+					})(),
 					...(s.parentSessionPath ? { parentSessionPath: s.parentSessionPath } : {}),
 				});
 			}
@@ -14328,8 +14346,16 @@ export class ClientSession {
 			}
 			rmSync(abs, { force: true });
 			await removeContextEvidence(abs);
-			// 转录删了，钉住记录一起清理（issue #433）。
+			// 转录删了，钉住和分类记录一起清理（issue #433）。
 			this.stateStore?.cleanPinnedSession(abs);
+			const liveSessionId = [...this.convs.values()].find((conv) => {
+				try {
+					return Boolean(conv.session.sessionFile && resolve(conv.session.sessionFile) === abs);
+				} catch {
+					return false;
+				}
+			})?.session.sessionId;
+			this.stateStore?.cleanConversationCategoryAssignment(liveSessionId, abs);
 			// 转录删了，sidecar 再留着就是孤儿，一起清掉（不存在不报错）。
 			removeTouchSidecar(abs);
 			// 转录删了，未发送草稿再留着就是孤儿，一起清掉。
@@ -14461,6 +14487,106 @@ export class ClientSession {
 		this.emitConversations();
 		this.flushSnapshot();
 		await this.refreshSessions();
+	}
+
+	/** Broadcast the shared category catalog to the attached client. */
+	pushConversationCategories(): void {
+		const categories: ConversationCategory[] = this.stateStore?.getConversationCategories() ?? [];
+		this.emit({ type: "conversation_categories", categories });
+	}
+
+	/** Create a category and broadcast the updated catalog. */
+	async createConversationCategory(name: string): Promise<void> {
+		const category = this.stateStore?.createConversationCategory(name);
+		if (!category) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "分类名为空、重复或分类数量已达上限",
+				textEn: "The category name is empty or duplicated, or the category limit has been reached",
+			});
+			return;
+		}
+		this.pushConversationCategories();
+	}
+
+	/** Rename a category without changing its assignments. */
+	async renameConversationCategory(id: string, name: string): Promise<void> {
+		const category = this.stateStore?.renameConversationCategory(id, name);
+		if (!category) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "无法重命名分类：名称为空或已存在",
+				textEn: "Could not rename the category: the name is empty or already exists",
+			});
+			return;
+		}
+		this.pushConversationCategories();
+	}
+
+	/** Delete a category; assigned chats return to Uncategorized. */
+	async deleteConversationCategory(id: string): Promise<void> {
+		if (!this.stateStore?.deleteConversationCategory(id)) return;
+		for (const conv of this.convs.values()) {
+			if (conv.categoryId === id) conv.categoryId = undefined;
+		}
+		this.pushConversationCategories();
+		this.emitConversations();
+		this.flushSnapshot();
+		await this.refreshSessions();
+	}
+
+	/** Move a live conversation or persisted session into a category. */
+	async setConversationCategory(
+		target: { conversationId?: string; path?: string },
+		categoryId: string | null,
+	): Promise<void> {
+		const categories = this.stateStore?.getConversationCategories() ?? [];
+		if (categoryId !== null && !categories.some((category) => category.id === categoryId)) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "目标分类不存在",
+				textEn: "The target category does not exist",
+			});
+			return;
+		}
+		const conv =
+			(target.conversationId ? this.convs.get(target.conversationId) : undefined) ??
+			(target.path
+				? [...this.convs.values()].find((candidate) => {
+						try {
+							return candidate.session.sessionFile
+								? normalizePathKey(candidate.session.sessionFile) === normalizePathKey(target.path!)
+								: false;
+						} catch {
+							return false;
+						}
+					})
+				: undefined);
+		if (!conv && !target.path) return;
+		if (conv) this.applyConversationCategory(conv, categoryId);
+		else {
+			this.stateStore?.setConversationCategoryId(undefined, target.path, categoryId);
+		}
+		this.emitConversations();
+		this.flushSnapshot();
+		await this.refreshSessions();
+	}
+
+	/** Synchronize one live conversation's category and durable assignment. */
+	private applyConversationCategory(conv: Conversation, categoryId: string | null): void {
+		const validCategoryId =
+			categoryId && this.stateStore?.getConversationCategories().some((category) => category.id === categoryId)
+				? categoryId
+				: null;
+		conv.categoryId = validCategoryId ?? undefined;
+		try {
+			this.stateStore?.setConversationCategoryId(conv.session.sessionId, conv.session.sessionFile, validCategoryId);
+		} catch {
+			// An unavailable SDK session cannot provide a durable key yet.
+		}
 	}
 
 	/** Rename a live conversation by id: retitle in memory AND persist a
@@ -14601,6 +14727,7 @@ export class ClientSession {
 			}
 			conv.isSubagent = false;
 			conv.isEphemeral = false;
+			if (conv.categoryId) this.applyConversationCategory(conv, conv.categoryId);
 			if (wasEphemeral) {
 				const ephemeralDir = join(this.agentDir, "ephemeral-sessions", conv.id);
 				try {
@@ -15286,6 +15413,12 @@ export class ClientSession {
 			if (this.stateStore?.isSessionPinned(targetCwd, targetPath)) {
 				conv.pinned = true;
 				conv.listed = true;
+			}
+			try {
+				const categoryId = this.stateStore?.getConversationCategoryId(conv.session.sessionId, targetPath);
+				if (categoryId) conv.categoryId = categoryId;
+			} catch {
+				// Category metadata is optional; opening the session must still succeed.
 			}
 			this.noticeInterruptedCompaction(conv);
 			this.convs.set(conv.id, conv);
@@ -16086,6 +16219,10 @@ export class ClientSession {
 						modified: s.modified.getTime(),
 						source: "web",
 						...(isPinned ? { pinned: true } : {}),
+						...(() => {
+							const categoryId = this.stateStore?.getConversationCategoryId(s.id, s.path);
+							return categoryId ? { categoryId } : {};
+						})(),
 					};
 					// Anchors were collected in the same streaming scan as the match.
 					return { ...base, anchors };

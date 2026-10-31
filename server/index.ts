@@ -1536,6 +1536,7 @@ export interface DispatchSession {
 		ephemeral?: boolean,
 		onReady?: (id: string) => void,
 		independent?: boolean,
+		categoryId?: string,
 	): Promise<boolean | void>;
 	deleteMessage?(messageId: string, conversationId?: string): Promise<void>;
 	editMessage(messageId: string, text: string, attachments?: PromptAttachment[]): Promise<void>;
@@ -1576,6 +1577,14 @@ export interface DispatchSession {
 	persistConversation?(id: string): Promise<void>;
 	setConversationPinned?(id: string, pinned: boolean): Promise<void>;
 	pinSession?(path: string, pinned: boolean): Promise<void>;
+	pushConversationCategories?(): void;
+	createConversationCategory?(name: string): Promise<void>;
+	renameConversationCategory?(id: string, name: string): Promise<void>;
+	deleteConversationCategory?(id: string): Promise<void>;
+	setConversationCategory?(
+		target: { conversationId?: string; path?: string },
+		categoryId: string | null,
+	): Promise<void>;
 	updatePlanStep?(stepId: string, patch: Partial<import("./protocol.js").PlanStep>, conversationId?: string): void;
 	deletePlanStep?(stepId: string, conversationId?: string): void;
 	addPlanStep?(step: import("./protocol.js").PlanStep, afterStepId?: string, conversationId?: string): void;
@@ -3090,6 +3099,7 @@ wss.on("connection", (ws) => {
 				nextSvc.applyPluginCommandCatalog();
 				newCs.flushSnapshot(true);
 				newCs.pushSettings();
+				newCs.pushConversationCategories?.();
 				void newCs.refreshSessions();
 				void newCs.pushProjects();
 				void newCs.listModels();
@@ -3698,6 +3708,7 @@ wss.on("connection", (ws) => {
 							// 插件命令可能在本客户端 attach 过程中才注册（首载竞态）——
 							// 重推一次目录，保证选择器完整。
 							service.applyPluginCommandCatalog();
+							cs.pushConversationCategories?.();
 							// 插件清单【先于】快照推送：前端渲染历史消息前就拿到 renderer
 							// 注册表（plugin-fence.ts），`` ```lang `` 围栏才能立即命中插件；
 							// 否则消息先落成普通代码块，清单后到也不会重渲。
