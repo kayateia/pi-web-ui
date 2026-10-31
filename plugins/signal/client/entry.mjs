@@ -4,7 +4,37 @@
 export default {
 	async mount(el, ctx) {
 		let state = {};
-		const send = async (type, payload = {}) => ctx.send({ type, ...payload });
+		let requestSeq = 0;
+		const pending = new Map();
+		const offData = ctx.onData?.((payload) => {
+			const requestId = typeof payload?.reqId === "string" ? payload.reqId : "";
+			const waiter = requestId ? pending.get(requestId) : undefined;
+			if (!waiter) return;
+			pending.delete(requestId);
+			clearTimeout(waiter.timer);
+			waiter.resolve(payload);
+		});
+		const send = (type, payload = {}) =>
+			new Promise((resolve, reject) => {
+				const reqId = `signal-${Date.now()}-${++requestSeq}`;
+				const timer = setTimeout(() => {
+					pending.delete(reqId);
+					reject(new Error(`Signal UI request timed out while waiting for "${type}".`));
+				}, 25_000);
+				pending.set(reqId, { resolve, reject, timer });
+				try {
+					const sent = ctx.send({ type, reqId, ...payload });
+					if (sent === false) {
+						clearTimeout(timer);
+						pending.delete(reqId);
+						reject(new Error(`Signal UI request "${type}" could not be sent.`));
+					}
+				} catch (error) {
+					clearTimeout(timer);
+					pending.delete(reqId);
+					reject(error);
+				}
+			});
 
 		el.innerHTML = `
 			<div class="signal-panel" style="display:flex;flex-direction:column;height:100%;box-sizing:border-box;background:var(--bg);color:var(--text);font-size:13px;">
@@ -233,7 +263,11 @@ export default {
 		q(".signal-test").addEventListener("click", async () => {
 			try {
 				const result = await send("test", { config: readConfig() });
-				alert?.(result?.message || (result?.success ? "Daemon reachable." : "Test failed."));
+				const detail =
+					result?.message ||
+					result?.error ||
+					(result?.success ? "Daemon reachable." : `Test failed: ${JSON.stringify(result)}`);
+				alert?.(detail);
 			} catch (error) {
 				alert?.(error.message);
 			}
@@ -257,5 +291,13 @@ export default {
 		});
 
 		await refresh();
+		return () => {
+			offData?.();
+			for (const waiter of pending.values()) {
+				clearTimeout(waiter.timer);
+				waiter.reject(new Error("Signal panel closed."));
+			}
+			pending.clear();
+		};
 	},
 };

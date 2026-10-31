@@ -286,21 +286,63 @@ export function validateDaemonUrl(value, allowRemote = false) {
 
 /** Minimal JSON-RPC client for signal-cli's loopback daemon. */
 async function daemonRpc(baseUrl, method, params, timeoutMs = 15_000) {
-	const res = await fetch(`${baseUrl}/api/v1/rpc`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			jsonrpc: "2.0",
-			id: Date.now(),
-			method,
-			params,
-		}),
-		signal: AbortSignal.timeout(timeoutMs),
-	});
-	if (!res.ok) throw new Error(`signal-cli HTTP ${res.status}`);
-	const json = await res.json();
+	let res;
+	try {
+		res = await fetch(`${baseUrl}/api/v1/rpc`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				jsonrpc: "2.0",
+				id: Date.now(),
+				method,
+				params,
+			}),
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+	} catch (error) {
+		throw new Error(`Cannot reach signal-cli at ${baseUrl}: ${formatSignalError(error)}`, {
+			cause: error,
+		});
+	}
+	if (!res.ok) {
+		const body = await res.text().catch(() => "");
+		const detail = body.trim().slice(0, 500);
+		throw new Error(`signal-cli HTTP ${res.status} for ${method} at ${baseUrl}${detail ? `: ${detail}` : ""}`);
+	}
+	let json;
+	try {
+		json = await res.json();
+	} catch (error) {
+		throw new Error(`signal-cli returned invalid JSON for ${method}: ${formatSignalError(error)}`, {
+			cause: error,
+		});
+	}
 	if (json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
 	return json?.result;
+}
+
+/** Produce a useful message for fetch/network failures without exposing payloads. */
+export function formatSignalError(error) {
+	if (!(error instanceof Error)) return String(error ?? "unknown error");
+	const parts = [error.message || error.name || "unknown error"];
+	let cause = error.cause;
+	for (let depth = 0; cause && depth < 3; depth += 1) {
+		if (cause instanceof Error) {
+			const code =
+				typeof cause.code === "string" && cause.code && !parts.join(" ").includes(cause.code) ? ` (${cause.code})` : "";
+			if (cause.message && !parts.some((part) => part.includes(cause.message))) {
+				parts.push(`${cause.message}${code}`);
+			}
+			cause = cause.cause;
+		} else if (typeof cause === "object" && cause && "code" in cause) {
+			const code = String(cause.code ?? "").trim();
+			if (code && !parts.join(" ").includes(code)) parts.push(code);
+			break;
+		} else {
+			break;
+		}
+	}
+	return parts.join(": ");
 }
 
 /** Signal gateway: one SSE reader feeding many isolated pi conversations. */
@@ -932,10 +974,16 @@ export default async function activate(host) {
 	}
 
 	host.onClientMessage?.(async (message, reply) => {
+		const requestId = typeof message?.reqId === "string" ? message.reqId : "";
+		const respond = (payload) =>
+			reply({
+				...payload,
+				...(requestId ? { reqId: requestId } : {}),
+			});
 		try {
 			switch (message?.type) {
 				case "get_state":
-					reply({
+					respond({
 						type: "state",
 						config: publicConfig(config),
 						status: gateway.getStatus(),
@@ -948,42 +996,62 @@ export default async function activate(host) {
 					await saveConfig(host, config);
 					await gateway.stop();
 					if (config.enabled && config.account) await gateway.start();
-					reply({ type: "save_config_done", success: true, status: gateway.getStatus() });
+					respond({ type: "save_config_done", success: true, status: gateway.getStatus() });
 					break;
 				}
 				case "start":
 					config.enabled = true;
 					await saveConfig(host, config);
 					await gateway.start();
-					reply({ type: "gateway_status", success: true, status: gateway.getStatus() });
+					respond({ type: "gateway_status", success: true, status: gateway.getStatus() });
 					break;
 				case "stop":
 					config.enabled = false;
 					await saveConfig(host, config);
 					await gateway.stop();
-					reply({ type: "gateway_status", success: true, status: gateway.getStatus() });
+					respond({ type: "gateway_status", success: true, status: gateway.getStatus() });
 					break;
 				case "test": {
 					const next = normalizeConfig(message.config || config);
 					const daemon = validateDaemonUrl(next.daemonUrl, false);
 					if (!daemon.ok) {
-						reply({ type: "test_done", success: false, message: daemon.error });
+						respond({ type: "test_done", success: false, message: daemon.error });
 						break;
 					}
 					try {
 						await daemonRpc(daemon.url, "version", {});
-						reply({ type: "test_done", success: true, message: "signal-cli daemon reachable." });
+						if (!next.account) {
+							respond({
+								type: "test_done",
+								success: false,
+								message: `signal-cli is reachable at ${daemon.url}, but the Signal account is missing or not a valid E.164 number.`,
+							});
+							break;
+						}
+						await daemonRpc(daemon.url, "listContacts", {
+							account: next.account,
+							allRecipients: true,
+						});
+						respond({
+							type: "test_done",
+							success: true,
+							message: `signal-cli is reachable at ${daemon.url} and account ${next.account} is available.`,
+						});
 					} catch (error) {
-						reply({ type: "test_done", success: false, message: error.message });
+						respond({
+							type: "test_done",
+							success: false,
+							message: `Signal connection test failed for ${daemon.url}${next.account ? ` (account ${next.account})` : ""}: ${formatSignalError(error)}`,
+						});
 					}
 					break;
 				}
 				default:
-					reply({ type: "error", message: `Unknown Signal plugin message: ${message?.type}` });
+					respond({ type: "error", message: `Unknown Signal plugin message: ${message?.type}` });
 					break;
 			}
 		} catch (error) {
-			reply({ type: "error", message: error.message });
+			respond({ type: "error", message: formatSignalError(error) });
 		}
 	});
 
