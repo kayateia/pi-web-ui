@@ -110,21 +110,16 @@ export default {
 						<label style="display:block;margin-top:10px;">Model (provider/model-id)
 							<input class="signal-model" type="text" style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);" />
 						</label>
-						<label style="display:block;margin-top:10px;">Prompt mode
-							<select class="signal-prompt-mode" style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);">
-								<option value="append">Append to the normal pi-web-ui prompt</option>
-								<option value="replace">Replace the normal prompt</option>
-							</select>
+						<label style="display:block;margin-top:10px;">Global Signal prompt
+							<textarea class="signal-prompt" rows="8" placeholder="Added after pi-web-ui's normal system prompt, tool guidance, and project context." style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);font-family:ui-monospace,monospace;"></textarea>
 						</label>
-						<label style="display:block;margin-top:10px;">Default system prompt
-							<textarea class="signal-prompt" rows="8" placeholder="You are responding in a Signal conversation..." style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);font-family:ui-monospace,monospace;"></textarea>
-						</label>
+						<div style="margin-top:6px;color:var(--text-dim);font-size:11px;line-height:1.45;">The normal pi-web-ui prompt is always retained. Channel prompts are added after this global Signal prompt.</div>
 					</section>
 
 					<section style="grid-column:1/-1;border:1px solid var(--border);border-radius:8px;background:var(--bg-elev);padding:16px;min-width:0;">
 						<h3 style="margin:0 0 8px;font-size:14px;">Channels</h3>
 						<div style="color:var(--text-dim);font-size:11px;line-height:1.5;margin-bottom:10px;">
-							Groups require an explicit enabled entry. Dialogue is keyed by <code>group:&lt;groupId&gt;</code> or <code>dm:&lt;aci&gt;</code>. Each entry supports the same profile fields as the defaults, plus <code>allowSenders</code>.
+							Groups require an explicit enabled entry. Dialogue is keyed by <code>group:&lt;groupId&gt;</code> or <code>dm:&lt;aci&gt;</code>. Each entry supports the same profile fields as the defaults, plus <code>allowSenders</code>. A channel's <code>systemPrompt</code> is appended after the global Signal prompt.
 						</div>
 						<textarea class="signal-channels" rows="14" spellcheck="false" style="width:100%;box-sizing:border-box;padding:9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);font-family:ui-monospace,monospace;line-height:1.45;"></textarea>
 						<div style="margin-top:12px;">
@@ -146,7 +141,6 @@ export default {
 		const thinking = q(".signal-thinking");
 		const workspace = q(".signal-workspace");
 		const model = q(".signal-model");
-		const promptMode = q(".signal-prompt-mode");
 		const prompt = q(".signal-prompt");
 		const channels = q(".signal-channels");
 		const badge = q(".signal-badge");
@@ -165,7 +159,6 @@ export default {
 			thinking.value = defaults.thinkingLevel || "";
 			workspace.value = defaults.workspace || "";
 			model.value = defaults.model || "";
-			promptMode.value = defaults.promptMode === "replace" ? "replace" : "append";
 			prompt.value = defaults.systemPrompt || "";
 			channels.value = JSON.stringify(config.channels || {}, null, 2);
 		}
@@ -194,7 +187,6 @@ export default {
 					thinkingLevel: thinking.value,
 					workspace: workspace.value.trim(),
 					model: model.value.trim(),
-					promptMode: promptMode.value,
 					systemPrompt: prompt.value,
 				},
 				channels: parsedChannels,

@@ -8,6 +8,7 @@ import { JSDOM } from "jsdom";
 import {
 	SignalGateway,
 	chunkSignalText,
+	composeSignalSystemPrompt,
 	formatSignalError,
 	isSenderAllowed,
 	normalizeConfig,
@@ -163,7 +164,7 @@ describe("Signal authorization and channel profiles", () => {
 		expect(resolveChannelProfile(member, config)).toBeNull();
 	});
 
-	it("inherits defaults when a channel prompt is blank", () => {
+	it("inherits the global prompt when a channel prompt is blank", () => {
 		const profile = resolveChannelProfile(parsed, {
 			...config,
 			channels: {
@@ -174,11 +175,28 @@ describe("Signal authorization and channel profiles", () => {
 				},
 			},
 		});
-		expect(profile).toMatchObject({
-			systemPrompt: "default prompt",
-			promptMode: "replace",
-			preset: "standard",
+		expect(profile?.systemPrompt).toContain("Signal gateway instructions:\ndefault prompt");
+		expect(profile?.systemPrompt).not.toContain("Signal channel instructions");
+		expect(profile?.promptMode).toBe("append");
+		expect(profile?.preset).toBe("standard");
+	});
+
+	it("adds the channel prompt after the global prompt and ignores legacy replace mode", () => {
+		const profile = resolveChannelProfile(parsed, {
+			...config,
+			channels: {
+				[parsed.key]: {
+					enabled: true,
+					systemPrompt: "channel prompt",
+					promptMode: "replace",
+				},
+			},
 		});
+		expect(profile?.systemPrompt).toBe(composeSignalSystemPrompt("default prompt", "channel prompt", parsed.title));
+		expect(profile?.systemPrompt.indexOf("default prompt")).toBeLessThan(
+			profile?.systemPrompt.indexOf("channel prompt") ?? -1,
+		);
+		expect(profile?.promptMode).toBe("append");
 	});
 });
 
@@ -227,6 +245,43 @@ describe("Signal delivery helpers", () => {
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(sent).toEqual(["reply"]);
 		expect(gateway.pendingRuns.has("c1")).toBe(false);
+	});
+
+	it("passes the composed global + channel prompt as an append layer", async () => {
+		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
+		const config = normalizeConfig({
+			allowedSenders: [`aci:${aliceUuid}`],
+			defaults: { systemPrompt: "global layer" },
+			channels: {
+				[parsed.key]: {
+					enabled: true,
+					name: "Alice DM",
+					systemPrompt: "channel layer",
+					promptMode: "replace",
+				},
+			},
+		});
+		const profile = resolveChannelProfile(parsed, config)!;
+		let captured: Record<string, unknown> | undefined;
+		const gateway = new SignalGateway({
+			host: {
+				conversations: {
+					ensure: async (request: Record<string, unknown>) => {
+						captured = request;
+						return { ok: true, conversationId: "c1" };
+					},
+				},
+			},
+			getConfig: () => config,
+			setSessionMap: async () => {},
+		});
+		await gateway.ensureConversation(parsed, profile);
+		expect(captured).toMatchObject({
+			systemPromptMode: "append",
+		});
+		expect(String(captured?.systemPrompt).indexOf("global layer")).toBeLessThan(
+			String(captured?.systemPrompt).indexOf("channel layer"),
+		);
 	});
 });
 

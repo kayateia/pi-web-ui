@@ -235,6 +235,25 @@ export function isOwnerSender(parsed, config) {
 	return parsed.sender.ids.some((id) => owners.has(id));
 }
 
+/**
+ * Compose the plugin-wide and channel-specific prompt additions.
+ *
+ * The result is always appended to pi-web-ui's normal system prompt, so the
+ * agent retains the regular coding preamble, tool guidance, project context,
+ * and all other host-generated prompt sections.
+ */
+export function composeSignalSystemPrompt(globalPrompt, channelPrompt, channelTitle = "") {
+	const sections = [];
+	const globalText = String(globalPrompt ?? "").trim();
+	const channelText = String(channelPrompt ?? "").trim();
+	if (globalText) sections.push(`Signal gateway instructions:\n${globalText}`);
+	if (channelText) {
+		const title = sanitizeSignalName(channelTitle);
+		sections.push(`Signal channel instructions${title ? ` for ${title}` : ""}:\n${channelText}`);
+	}
+	return sections.join("\n\n");
+}
+
 /** Resolve a channel profile, inheriting defaults and enforcing group opt-in. */
 export function resolveChannelProfile(parsed, config) {
 	const channels =
@@ -244,20 +263,14 @@ export function resolveChannelProfile(parsed, config) {
 	if (parsed.kind === "group" && !configured) return null;
 	if (parsed.kind === "group" && configured?.enabled !== true) return null;
 	const defaults = config?.defaults && typeof config.defaults === "object" ? config.defaults : {};
-	const channelPrompt = String(configured?.systemPrompt ?? "").trim();
+	const title = sanitizeSignalName(configured?.name) || parsed.title;
 	return {
 		...defaults,
 		...configured,
 		key: parsed.key,
-		title: sanitizeSignalName(configured?.name) || parsed.title,
-		systemPrompt: channelPrompt || String(defaults.systemPrompt ?? ""),
-		promptMode: channelPrompt
-			? configured?.promptMode === "replace"
-				? "replace"
-				: "append"
-			: defaults.promptMode === "replace"
-				? "replace"
-				: "append",
+		title,
+		systemPrompt: composeSignalSystemPrompt(defaults.systemPrompt, configured?.systemPrompt, title),
+		promptMode: "append",
 		preset: String(configured?.preset || defaults.preset || "").trim(),
 		workspace: String(configured?.workspace || defaults.workspace || "").trim(),
 		model: String(configured?.model || defaults.model || "").trim(),
@@ -611,7 +624,9 @@ export class SignalGateway {
 			...(channelConfig.workspace ? { cwd: channelConfig.workspace } : {}),
 			...(channelConfig.preset ? { preset: channelConfig.preset } : {}),
 			systemPrompt: String(channelConfig.systemPrompt ?? ""),
-			systemPromptMode: channelConfig.promptMode === "replace" ? "replace" : "append",
+			// Always retain pi-web-ui's main prompt. Gateway and channel text are
+			// additive layers on top of the normal preamble and tool guidance.
+			systemPromptMode: "append",
 			...(Array.isArray(channelConfig.enabledSkills) ? { enabledSkills: channelConfig.enabledSkills } : {}),
 			...(Array.isArray(channelConfig.enabledExtensions) ? { enabledExtensions: channelConfig.enabledExtensions } : {}),
 			...(existing.sessionFile ? { sessionFile: existing.sessionFile } : {}),
@@ -905,7 +920,7 @@ export function normalizeConfig(value) {
 			raw.defaults && typeof raw.defaults === "object" && !Array.isArray(raw.defaults)
 				? {
 						systemPrompt: String(raw.defaults.systemPrompt || "").slice(0, 32_768),
-						promptMode: raw.defaults.promptMode === "replace" ? "replace" : "append",
+						promptMode: "append",
 						preset: String(raw.defaults.preset || "").trim(),
 						workspace: String(raw.defaults.workspace || "").trim(),
 						model: String(raw.defaults.model || "").trim(),
@@ -926,7 +941,7 @@ export function normalizeConfig(value) {
 							? channel.allowSenders.map(normalizeSenderId).filter(Boolean).slice(0, 256)
 							: [],
 						systemPrompt: String(channel.systemPrompt || "").slice(0, 32_768),
-						promptMode: channel.promptMode === "replace" ? "replace" : "append",
+						promptMode: "append",
 						preset: String(channel.preset || "").trim(),
 						workspace: String(channel.workspace || "").trim(),
 						model: String(channel.model || "").trim(),

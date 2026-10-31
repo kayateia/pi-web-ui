@@ -41,7 +41,6 @@ The channel JSON supports:
 		"enabled": true,
 		"name": "Family",
 		"allowSenders": ["aci:..."],
-		"promptMode": "append",
 		"systemPrompt": "You are responding in the family group.",
 		"preset": "standard",
 		"workspace": "/home/user/project",
@@ -50,6 +49,16 @@ The channel JSON supports:
 	}
 }
 ```
+
+Prompt composition is always additive:
+
+1. pi-web-ui's normal system prompt, including its preamble, tool guidance, and
+   project context
+2. the global Signal prompt from the plugin panel
+3. the selected channel's `systemPrompt`
+
+Legacy `promptMode: "replace"` values are ignored so a channel cannot
+accidentally drop the normal pi-web-ui prompt.
 
 Commands arriving from an allowed sender:
 
