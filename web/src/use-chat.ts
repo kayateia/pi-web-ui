@@ -11,6 +11,7 @@ import type {
 	ClientMessage,
 	BgServer,
 	CommandDef,
+	ConversationCategory,
 	ConversationSummary,
 	ElsewhereRunning,
 	FileContent,
@@ -295,6 +296,8 @@ export interface ChatState {
 	tabs?: string[];
 	/** Persisted session list for the left panel. */
 	sessions: SessionSummary[];
+	/** Shared topical conversation categories. */
+	conversationCategories: ConversationCategory[];
 	/** Open conversations (each runs its own session in parallel). */
 	conversations: ConversationSummary[];
 	/** issue #145：在其他客户端（标签页/设备）上正在跑的对话（只读感知，不可点）。 */
@@ -627,6 +630,7 @@ type Action =
 	  }
 	| { type: "engines_status"; engines: EngineStatus[] }
 	| { type: "sessions"; sessions: SessionSummary[] }
+	| { type: "conversation_categories"; categories: ConversationCategory[] }
 	| {
 			type: "conversations";
 			conversations: ConversationSummary[];
@@ -1237,6 +1241,8 @@ export function reducer(state: ChatState, action: Action): ChatState {
 		case "sessions":
 			writeCachedSessions(state.state?.cwd, action.sessions, state.engine);
 			return { ...state, sessions: action.sessions };
+		case "conversation_categories":
+			return { ...state, conversationCategories: action.categories };
 		case "conversations":
 			return {
 				...state,
@@ -1871,6 +1877,7 @@ export function useChat() {
 		toolStatuses: new Map(),
 		notices: [],
 		sessions: readCachedSessions(),
+		conversationCategories: [],
 		conversations: [],
 		elsewhere: [],
 		activeConversationId: "",
@@ -2447,6 +2454,9 @@ export function useChat() {
 					break;
 				case "sessions":
 					dispatch({ type: "sessions", sessions: msg.sessions });
+					break;
+				case "conversation_categories":
+					dispatch({ type: "conversation_categories", categories: msg.categories });
 					break;
 				case "conversations":
 					dispatch({

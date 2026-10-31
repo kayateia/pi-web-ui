@@ -2359,6 +2359,7 @@ export function App() {
 								conversations={chat.conversations}
 								elsewhere={chat.elsewhere}
 								sessions={chat.sessions}
+								conversationCategories={chat.conversationCategories}
 								projects={chat.projects}
 								pathCompletions={chat.pathCompletions}
 								activeConversationId={activeGroupId ? "" : chat.activeConversationId}
