@@ -207,6 +207,12 @@ try {
 	check("thinkingWrap off round-trips", stTW.settings.thinkingWrap === false);
 	c.send({ type: "set_settings", thinkingWrap: true });
 	await c.waitFor("settings_state", 8000, (m) => m.settings.thinkingWrap === true);
+	// 折叠思考预览：默认开（保持旧行为）→ 关（静默模式）→ 开
+	check("thinkingPreviewEnabled defaults on", st0.settings.thinkingPreviewEnabled === true);
+	c.send({ type: "set_settings", thinkingPreviewEnabled: false });
+	await c.waitFor("settings_state", 8000, (m) => m.settings.thinkingPreviewEnabled === false);
+	c.send({ type: "set_settings", thinkingPreviewEnabled: true });
+	await c.waitFor("settings_state", 8000, (m) => m.settings.thinkingPreviewEnabled === true);
 
 	// 保留已结束的运行对话（切走时不释放 runtime，手动 ✕ 才移出）：默认关 → 开 → 再关
 	// （回归：dispatch 白名单漏转发该字段 → 点开关不落盘、刷新回退，同 terminalBash 那次）

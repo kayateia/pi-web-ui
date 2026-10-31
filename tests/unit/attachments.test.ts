@@ -148,6 +148,7 @@ function makeCtx(opts: {
 			reviewPrompt: "",
 			reviewDisabledSkills: [],
 			thinkingWrap: true,
+			thinkingPreviewEnabled: true,
 			toolsWrap: true,
 			toolImagesEnabled: true,
 			keepRecentMessages: 15,
