@@ -886,7 +886,15 @@ export type ClientMessage =
 	 *  Answered exactly once by an scm_data with kind "commitmsg" — text
 	 *  carries the generated single-line message; ok:false on any failure. */
 	| { type: "scm_commitmsg"; reqId: number }
-	| { type: "new_chat"; preset?: string; ephemeral?: boolean; requestId?: string; independent?: boolean }
+	| {
+			type: "new_chat";
+			preset?: string;
+			ephemeral?: boolean;
+			requestId?: string;
+			independent?: boolean;
+			/** Optional topical bucket for the new conversation. */
+			categoryId?: string;
+	  }
 	| { type: "open_shared_conversation"; owner: string; id: string }
 	/** Omit one message and its related attachments/tool results from the current branch. */
 	| { type: "delete_message"; messageId: string; conversationId?: string }
@@ -1711,6 +1719,22 @@ export type ClientMessage =
 	| { type: "pin_conversation"; id: string; pinned: boolean }
 	/** 钉住 / 取消钉住历史会话文件（持久化到 client-state.json 并在历史列表展示 📌）。 */
 	| { type: "pin_session"; path: string; pinned: boolean }
+	/** Request the shared conversation category definitions. */
+	| { type: "list_conversation_categories" }
+	/** Create a globally shared conversation category. */
+	| { type: "create_conversation_category"; name: string }
+	/** Rename an existing category while preserving its assignments. */
+	| { type: "rename_conversation_category"; id: string; name: string }
+	/** Delete a category and move its conversations back to Uncategorized. */
+	| { type: "delete_conversation_category"; id: string }
+	/** Move one running conversation or persisted session into a category.
+	 *  categoryId=null returns it to Uncategorized. */
+	| {
+			type: "set_conversation_category";
+			conversationId?: string;
+			path?: string;
+			categoryId: string | null;
+	  }
 	/** Bulk-dismiss FINISHED subagents from the running list (right-click menu).
 	 *  parentId omitted = all finished subagents; given = the transitive
 	 *  subagent descendants of that conversation (children, grandchildren, …),
@@ -1837,6 +1861,8 @@ export interface SessionSummary {
 	source?: "web" | "tui";
 	/** 用户钉住（常驻运行列表 / 历史置顶）：带 📌 标记。 */
 	pinned?: boolean;
+	/** User-defined topical category, absent = Uncategorized. */
+	categoryId?: string;
 	/** 父会话路径（由编辑重问或分支派生产生的子会话，供历史列表展示分支标记）。 */
 	parentSessionPath?: string;
 }
@@ -3115,6 +3141,8 @@ export interface ConversationSummary {
 	isEphemeral?: boolean;
 	/** 用户钉住（常驻运行列表）：切走也不释放，左栏行带 📌 标记。 */
 	pinned?: boolean;
+	/** User-defined topical category, absent = Uncategorized. */
+	categoryId?: string;
 	/** 该对话当前有存活且用过的用户终端（阻断普通移出，点 X 提示两段确认强制移出）。 */
 	hasUserTerminals?: boolean;
 	/** 派生源信息（若本会话是从另一会话的消息派生而来）。 */
@@ -3901,6 +3929,8 @@ export type ServerMessage =
 	/** Sent every ~2s so clients can detect half-open connections and display host metrics / network latency. */
 	| { type: "heartbeat"; hostMetrics?: UiHostMetrics; latencyMs?: number }
 	| { type: "sessions"; sessions: SessionSummary[] }
+	/** Shared conversation category definitions, pushed on attach and after changes. */
+	| { type: "conversation_categories"; categories: ConversationCategory[] }
 	/** Filename matches for the global search panel (reqId echo). Always sent
 	 *  in reply to a search_files request — ok:false means the walk failed. */
 	| {
