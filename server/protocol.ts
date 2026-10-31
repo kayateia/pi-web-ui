@@ -1841,6 +1841,14 @@ export interface SessionSummary {
 	parentSessionPath?: string;
 }
 
+/** User-defined topical bucket for conversations and persisted sessions. */
+export interface ConversationCategory {
+	id: string;
+	name: string;
+	/** Stable display order; lower values render first. */
+	order: number;
+}
+
 /** 会话转录中一条命中消息的定位锚点：会话载入后按 role + timestamp 在
  *  UiMessage[] 里找到对应消息，用于「搜索会话 → 跳到对应位置」。 */
 export interface MessageAnchor {

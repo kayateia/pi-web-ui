@@ -7,6 +7,7 @@
  * 从 agent-service.ts 抽出，行为保持不变。
  */
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { normalizeUploadMaxMb } from "./payload-limits.js";
 import * as fsPromises from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -15,7 +16,7 @@ import { normalizeSoftCapByModel, normalizeSoftCapTokens } from "./soft-cap.js";
 import { deriveLegacy, legacyToDisabled, normalizeDisabledAgentTools } from "./tool-manager.js";
 import { normalizeToolPromptOverrides, type ToolPromptOverrideMap } from "./tool-prompt-overrides.js";
 import { UI_SLOTS } from "./plugin-ui-slots.js";
-import type { EngineId, QueueMode, UiAlign, UiLayoutPrefs, UiSlotId } from "./protocol.js";
+import type { ConversationCategory, EngineId, QueueMode, UiAlign, UiLayoutPrefs, UiSlotId } from "./protocol.js";
 
 /** System-prompt mode: append the custom text to the built prompt, or replace
  *  the whole system prompt with it. (遗留字段：主会话已迁移到 compose 模板，
@@ -42,6 +43,16 @@ export const DEFAULT_TOOL_WATCHDOG_TIMEOUT_MS = (() => {
 export const DEFAULT_KEEP_RECENT_MESSAGES = 15;
 export const KEEP_RECENT_MESSAGES_MIN = 5;
 export const KEEP_RECENT_MESSAGES_MAX = 100;
+
+/** Conversation category display/name limits. */
+export const CONVERSATION_CATEGORY_NAME_MAX = 48;
+export const MAX_CONVERSATION_CATEGORIES = 50;
+
+/** Normalize a category name to the durable form accepted by the UI and store. */
+export function normalizeConversationCategoryName(value: unknown): string {
+	if (typeof value !== "string") return "";
+	return value.trim().replace(/\s+/g, " ").slice(0, CONVERSATION_CATEGORY_NAME_MAX);
+}
 
 /** 归一化常驻渲染消息数：缺省/非数值回落默认值；有效整数钳到 [5, 100]。 */
 export function normalizeKeepRecentMessages(v: unknown): number {
@@ -682,6 +693,10 @@ export interface ClientState {
 	markers?: MarkerSettings;
 	/** 用户钉住（常驻运行列表）的会话文件路径列表，按项目 (cwd) 索引持久化在 __settings__ 下。 */
 	pinnedSessions?: Record<string, string[]>;
+	/** User-defined topical conversation buckets (global across projects). */
+	conversationCategories?: ConversationCategory[];
+	/** Category assignments keyed by stable session id or normalized session path. */
+	conversationCategoryAssignments?: Record<string, string>;
 	/** 会话重命名标题记忆（cwd -> sessionKey -> title），在无法修改日志原帧的引擎（如 DSH/只读引擎）下持久化保存自定义会话名称 */
 	sessionTitles?: Record<string, Record<string, string>>;
 	/** Browser UI locale code as reported by hello/set_locale (e.g. "zh",
@@ -1758,6 +1773,140 @@ export class ClientStateStore {
 			}
 			this.save();
 		}
+	}
+
+	/** Return category definitions in their persisted display order. */
+	getConversationCategories(): ConversationCategory[] {
+		const categories = this.load()[ClientStateStore.GLOBAL_SETTINGS_KEY]?.conversationCategories ?? [];
+		return categories
+			.map((category) => ({
+				id: category.id,
+				name: normalizeConversationCategoryName(category.name),
+				order: Number.isFinite(category.order) ? Math.floor(category.order) : 0,
+			}))
+			.filter((category) => category.id.length > 0 && category.name.length > 0)
+			.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+			.map((category) => ({ ...category }));
+	}
+
+	/** Create a category. Duplicate names are rejected case-insensitively. */
+	createConversationCategory(name: string): ConversationCategory | null {
+		const normalized = normalizeConversationCategoryName(name);
+		if (!normalized) return null;
+		const all = this.load();
+		const state = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
+		const categories = state.conversationCategories ?? [];
+		if (
+			categories.length >= MAX_CONVERSATION_CATEGORIES ||
+			categories.some((category) => category.name.toLocaleLowerCase() === normalized.toLocaleLowerCase())
+		) {
+			return null;
+		}
+		const category: ConversationCategory = {
+			id: `category-${randomUUID()}`,
+			name: normalized,
+			order: categories.reduce((max, item) => Math.max(max, item.order + 1), 0),
+		};
+		state.conversationCategories = [...categories, category];
+		this.save();
+		return { ...category };
+	}
+
+	/** Rename a category while preserving its id and assignment. */
+	renameConversationCategory(id: string, name: string): ConversationCategory | null {
+		const normalized = normalizeConversationCategoryName(name);
+		if (!id || !normalized) return null;
+		const all = this.load();
+		const state = all[ClientStateStore.GLOBAL_SETTINGS_KEY];
+		const category = state?.conversationCategories?.find((item) => item.id === id);
+		if (!state || !category) return null;
+		if (
+			state.conversationCategories?.some(
+				(item) => item.id !== id && item.name.toLocaleLowerCase() === normalized.toLocaleLowerCase(),
+			)
+		) {
+			return null;
+		}
+		category.name = normalized;
+		this.save();
+		return { ...category };
+	}
+
+	/** Delete a category and clear every assignment that targeted it. */
+	deleteConversationCategory(id: string): boolean {
+		const all = this.load();
+		const state = all[ClientStateStore.GLOBAL_SETTINGS_KEY];
+		const categories = state?.conversationCategories;
+		if (!state || !categories?.some((category) => category.id === id)) return false;
+		state.conversationCategories = categories.filter((category) => category.id !== id);
+		if (state.conversationCategories.length === 0) delete state.conversationCategories;
+		if (state.conversationCategoryAssignments) {
+			for (const [key, categoryId] of Object.entries(state.conversationCategoryAssignments)) {
+				if (categoryId === id) delete state.conversationCategoryAssignments[key];
+			}
+			if (Object.keys(state.conversationCategoryAssignments).length === 0) {
+				delete state.conversationCategoryAssignments;
+			}
+		}
+		this.save();
+		return true;
+	}
+
+	/** Keys used to resolve one conversation across live and historical views. */
+	private conversationCategoryKeys(sessionId?: string, sessionPath?: string): string[] {
+		const keys: string[] = [];
+		if (sessionId?.trim()) keys.push(`session:${sessionId.trim()}`);
+		if (sessionPath?.trim()) keys.push(`path:${normalizePathKey(sessionPath)}`);
+		return keys;
+	}
+
+	/** Resolve a session's category, preferring its stable session id. */
+	getConversationCategoryId(sessionId?: string, sessionPath?: string): string | undefined {
+		const assignments = this.load()[ClientStateStore.GLOBAL_SETTINGS_KEY]?.conversationCategoryAssignments;
+		if (!assignments) return undefined;
+		for (const key of this.conversationCategoryKeys(sessionId, sessionPath)) {
+			const categoryId = assignments[key];
+			if (categoryId) return categoryId;
+		}
+		return undefined;
+	}
+
+	/** Assign or clear a session category on every available stable key. */
+	setConversationCategoryId(
+		sessionId: string | undefined,
+		sessionPath: string | undefined,
+		categoryId: string | null,
+	): void {
+		const all = this.load();
+		const state = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
+		const assignments = (state.conversationCategoryAssignments ??= {});
+		const keys = this.conversationCategoryKeys(sessionId, sessionPath);
+		if (categoryId === null || !state.conversationCategories?.some((category) => category.id === categoryId)) {
+			for (const key of keys) delete assignments[key];
+		} else {
+			for (const key of keys) assignments[key] = categoryId;
+		}
+		if (Object.keys(assignments).length === 0) delete state.conversationCategoryAssignments;
+		this.save();
+	}
+
+	/** Remove assignments when the underlying session is deleted. */
+	cleanConversationCategoryAssignment(sessionId?: string, sessionPath?: string): void {
+		const all = this.load();
+		const assignments = all[ClientStateStore.GLOBAL_SETTINGS_KEY]?.conversationCategoryAssignments;
+		if (!assignments) return;
+		let changed = false;
+		for (const key of this.conversationCategoryKeys(sessionId, sessionPath)) {
+			if (key in assignments) {
+				delete assignments[key];
+				changed = true;
+			}
+		}
+		if (!changed) return;
+		if (Object.keys(assignments).length === 0) {
+			delete all[ClientStateStore.GLOBAL_SETTINGS_KEY]!.conversationCategoryAssignments;
+		}
+		this.save();
 	}
 
 	/** 全局默认 key 跟随删除：被删的 key 若是全局默认记的，指到接替者（无接替则删引用）。 */
