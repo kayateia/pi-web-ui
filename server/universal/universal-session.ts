@@ -17,6 +17,7 @@ import type { DispatchSession, TerminalManagerLike } from "../index.js";
 import type {
 	ClientMessage,
 	CommandDef,
+	ConversationCategory,
 	ConversationSummary,
 	ModelInfo,
 	PromptAttachment,
@@ -1166,10 +1167,17 @@ export class UniversalSession implements DispatchSession {
 	// 对话生命周期
 	// ---------------------------------------------------------------------------
 
-	async newChat(_preset?: string, ephemeral = false, onReady?: (id: string) => void): Promise<boolean | void> {
+	async newChat(
+		_preset?: string,
+		ephemeral = false,
+		onReady?: (id: string) => void,
+		_independent?: boolean,
+		categoryId?: string,
+	): Promise<boolean | void> {
 		const newConv = this.createEmptyConversation("新对话", Boolean(ephemeral));
 		this.conversations.set(newConv.id, newConv);
 		this.activeConvId = newConv.id;
+		if (categoryId !== undefined) this.setStoredConversationCategory(newConv.id, categoryId);
 		if (!newConv.isEphemeral) {
 			this.store.saveConversation(this.cwd, newConv);
 		}
@@ -1259,6 +1267,7 @@ export class UniversalSession implements DispatchSession {
 		const targetId = path.trim() || this.activeConvId;
 		// 1. 从磁盘删除持久化会话记录
 		this.store.deleteConversation(this.cwd, targetId);
+		this.stateStore?.cleanConversationCategoryAssignment(targetId, undefined);
 		// 2. 若内存中存在该会话，将其从内存中移除
 		if (this.conversations.has(targetId)) {
 			await this.dismissConversation(targetId, true, true);
@@ -1531,6 +1540,9 @@ export class UniversalSession implements DispatchSession {
 			messageCount: c.messages.length,
 			isStreaming: Boolean(c.id === this.activeConvId ? this.isStreaming : c.subagentStreaming),
 			isSubagent: Boolean(c.isSubagent),
+			...(this.stateStore?.getConversationCategoryId(c.id)
+				? { categoryId: this.stateStore.getConversationCategoryId(c.id) }
+				: {}),
 			subagentType: c.subagentType,
 			subagentParentId: c.subagentParentId,
 			subagentState: c.subagentState,
@@ -1561,9 +1573,72 @@ export class UniversalSession implements DispatchSession {
 					messageCount: c.messages.length,
 					modified: c.updatedAt,
 					pinned: Boolean(c.pinned),
+					...(this.stateStore?.getConversationCategoryId(c.id)
+						? { categoryId: this.stateStore.getConversationCategoryId(c.id) }
+						: {}),
 				};
 			});
 		this.send({ type: "sessions", sessions: sessionSummaries });
+	}
+
+	/** Broadcast the shared category catalog to the attached client. */
+	pushConversationCategories(): void {
+		const categories: ConversationCategory[] = this.stateStore?.getConversationCategories() ?? [];
+		this.send({ type: "conversation_categories", categories });
+	}
+
+	/** Create a category and broadcast the updated catalog. */
+	async createConversationCategory(name: string): Promise<void> {
+		if (!this.stateStore?.createConversationCategory(name)) {
+			this.emitNotice(
+				"warning",
+				"分类名为空、重复或分类数量已达上限",
+				"The category name is empty or duplicated, or the category limit has been reached",
+			);
+			return;
+		}
+		this.pushConversationCategories();
+	}
+
+	/** Rename a category without changing assignments. */
+	async renameConversationCategory(id: string, name: string): Promise<void> {
+		if (!this.stateStore?.renameConversationCategory(id, name)) {
+			this.emitNotice(
+				"warning",
+				"无法重命名分类：名称为空或已存在",
+				"Could not rename the category: the name is empty or already exists",
+			);
+			return;
+		}
+		this.pushConversationCategories();
+	}
+
+	/** Delete a category; assigned chats fall back to Uncategorized. */
+	async deleteConversationCategory(id: string): Promise<void> {
+		if (!this.stateStore?.deleteConversationCategory(id)) return;
+		this.pushConversationCategories();
+		void this.refreshSessions();
+	}
+
+	/** Move a logical universal conversation into a category. */
+	async setConversationCategory(
+		target: { conversationId?: string; path?: string },
+		categoryId: string | null,
+	): Promise<void> {
+		const targetId = target.conversationId || target.path;
+		if (!targetId) return;
+		const categories = this.stateStore?.getConversationCategories() ?? [];
+		if (categoryId !== null && !categories.some((category) => category.id === categoryId)) {
+			this.emitNotice("warning", "目标分类不存在", "The target category does not exist");
+			return;
+		}
+		this.setStoredConversationCategory(targetId, categoryId);
+		void this.refreshSessions();
+	}
+
+	/** Persist one logical conversation category assignment. */
+	private setStoredConversationCategory(conversationId: string, categoryId: string | null): void {
+		this.stateStore?.setConversationCategoryId(conversationId, undefined, categoryId);
 	}
 
 	/** 引擎自属的会话展示名解析回调（定制 Universal/Claude 的首条截断 + 自定义命名策略） */

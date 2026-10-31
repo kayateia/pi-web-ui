@@ -72,6 +72,7 @@ import type {
 	BgServer,
 	ClientMessage,
 	CommandDef,
+	ConversationCategory,
 	ConversationSummary,
 	DshPermissionOption,
 	ElsewhereRunning,
@@ -220,6 +221,8 @@ interface DshConversation {
 	/** 持久消息（回放 JSONL 初始化 + 事件增量追加；按 id 去重）。 */
 	messages: UiMessage[];
 	messageIds: Set<string>;
+	/** User-defined topical category (absent = Uncategorized). */
+	categoryId?: string;
 	streaming: DshStreamAccumulator | null;
 	isStreaming: boolean;
 	turnTiming?: UiState["turnTiming"];
@@ -1252,6 +1255,8 @@ export class DshClientSession {
 			streamAnchor: 0,
 			streamTurn: 0,
 		};
+		const categoryId = this.stateStore?.getConversationCategoryId(sessionId, sessionFilePath);
+		if (categoryId) conv.categoryId = categoryId;
 		if (replay) {
 			// 从磁盘 JSONL 回放历史消息（DSH 事件流不重放历史）。
 			try {
@@ -1963,6 +1968,7 @@ export class DshClientSession {
 				isStreaming: conv.isStreaming,
 				isSubagent: false,
 				pinned: isPinned,
+				...(conv.categoryId ? { categoryId: conv.categoryId } : {}),
 				...(conv.terminals.countUserBlockingLive() > 0 ? { hasUserTerminals: true as const } : {}),
 				// DSH Agent 预设（左栏徽标/详情用；pi 引擎不填）。
 				agentPreset: conv.agentPreset,
@@ -2001,7 +2007,13 @@ export class DshClientSession {
 	/** 语义同 pi 引擎的 newChat：true = 当前活动对话是可接收首条的空白新对话
 	 *  （/new <prompt> 靠它决定要不要把首条提示发出去）。preset = 新会话预设
 	 *  （复用空白会话时等价一次空白切换）。 */
-	async newChat(preset?: string, _ephemeral?: boolean, onReady?: (id: string) => void): Promise<boolean> {
+	async newChat(
+		preset?: string,
+		_ephemeral?: boolean,
+		onReady?: (id: string) => void,
+		_independent?: boolean,
+		categoryId?: string,
+	): Promise<boolean> {
 		if (this.switchingWorkspace) return false;
 		if (this.quiesceBlocked()) return false;
 		const active = this.conv;
@@ -2011,6 +2023,7 @@ export class DshClientSession {
 				this.pushSettings();
 				this.flushSnapshot();
 			}
+			if (categoryId !== undefined) this.applyConversationCategory(active, categoryId);
 			onReady?.(active.id);
 			return true;
 		}
@@ -2020,6 +2033,7 @@ export class DshClientSession {
 				this.switchConversation(conv.id);
 				if (preset) await this.selectAgentPreset(preset);
 				else this.flushSnapshot();
+				if (categoryId !== undefined) this.applyConversationCategory(conv, categoryId);
 				onReady?.(conv.id);
 				return true;
 			}
@@ -2039,6 +2053,7 @@ export class DshClientSession {
 		const prevModel = this.model;
 		active.listed = this.shouldRetainDshConversation(active);
 		const conv = this.addConversation(`chat-${randomUUID().slice(0, 12)}`, this.cwd, false, preset);
+		if (categoryId !== undefined) this.applyConversationCategory(conv, categoryId);
 		this.activeId = conv.id;
 		this.model = prevModel;
 		this.emitConversations();
@@ -2793,6 +2808,10 @@ export class DshClientSession {
 						modified: statSync(file).mtimeMs,
 						source: "web",
 						pinned: isPinned,
+						...(() => {
+							const categoryId = this.stateStore?.getConversationCategoryId(sessionId, file);
+							return categoryId ? { categoryId } : {};
+						})(),
 					});
 				} catch {
 					/* skip unreadable */
@@ -2838,6 +2857,98 @@ export class DshClientSession {
 			this.emitConversations();
 			void this.pushSessions();
 		}
+	}
+
+	/** Broadcast the shared category catalog to the attached client. */
+	pushConversationCategories(): void {
+		const categories: ConversationCategory[] = this.stateStore?.getConversationCategories() ?? [];
+		this.emit({ type: "conversation_categories", categories });
+	}
+
+	/** Create a category and broadcast the updated catalog. */
+	async createConversationCategory(name: string): Promise<void> {
+		if (!this.stateStore?.createConversationCategory(name)) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "分类名为空、重复或分类数量已达上限",
+				textEn: "The category name is empty or duplicated, or the category limit has been reached",
+			});
+			return;
+		}
+		this.pushConversationCategories();
+	}
+
+	/** Rename a category without changing assignments. */
+	async renameConversationCategory(id: string, name: string): Promise<void> {
+		if (!this.stateStore?.renameConversationCategory(id, name)) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "无法重命名分类：名称为空或已存在",
+				textEn: "Could not rename the category: the name is empty or already exists",
+			});
+			return;
+		}
+		this.pushConversationCategories();
+	}
+
+	/** Delete a category; assigned chats fall back to Uncategorized. */
+	async deleteConversationCategory(id: string): Promise<void> {
+		if (!this.stateStore?.deleteConversationCategory(id)) return;
+		for (const conv of this.convs.values()) {
+			if (conv.categoryId === id) conv.categoryId = undefined;
+		}
+		this.pushConversationCategories();
+		this.emitConversations();
+		await this.pushSessions();
+	}
+
+	/** Move a live DSH conversation or persisted session into a category. */
+	async setConversationCategory(
+		target: { conversationId?: string; path?: string },
+		categoryId: string | null,
+	): Promise<void> {
+		const categories = this.stateStore?.getConversationCategories() ?? [];
+		if (categoryId !== null && !categories.some((category) => category.id === categoryId)) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "目标分类不存在",
+				textEn: "The target category does not exist",
+			});
+			return;
+		}
+		const targetPath = target.path?.trim();
+		const sessionId = targetPath ? basename(dirname(resolve(targetPath))) : "";
+		const conv =
+			(target.conversationId ? this.convs.get(target.conversationId) : undefined) ??
+			(targetPath
+				? [...this.convs.values()].find(
+						(candidate) =>
+							candidate.sessionId === sessionId ||
+							candidate.id === targetPath ||
+							(candidate.sessionFile && normalizePathKey(candidate.sessionFile) === normalizePathKey(targetPath)),
+					)
+				: undefined);
+		if (conv) this.applyConversationCategory(conv, categoryId);
+		else if (targetPath) this.stateStore?.setConversationCategoryId(sessionId || undefined, targetPath, categoryId);
+		this.emitConversations();
+		await this.pushSessions();
+	}
+
+	/** Synchronize one live DSH conversation's category and durable assignment. */
+	private applyConversationCategory(conv: DshConversation, categoryId: string | null): void {
+		const validCategoryId =
+			categoryId && this.stateStore?.getConversationCategories().some((category) => category.id === categoryId)
+				? categoryId
+				: null;
+		conv.categoryId = validCategoryId ?? undefined;
+		this.stateStore?.setConversationCategoryId(
+			conv.sessionId,
+			conv.sessionFile || this.guessSessionFile(conv),
+			validCategoryId,
+		);
 	}
 
 	saveDraft(sessionId: string, text: string, ts: number): void {
@@ -2926,6 +3037,8 @@ export class DshClientSession {
 				return;
 			}
 			rmSync(abs, { recursive: true, force: true });
+			const sid = basename(dirname(abs));
+			this.stateStore?.cleanConversationCategoryAssignment(sid, abs);
 			await this.pushSessions();
 			this.emit({ type: "notice", level: "info", text: "会话已删除", textEn: "Session deleted" });
 		} catch (err) {
