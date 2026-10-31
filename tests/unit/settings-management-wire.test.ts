@@ -14,7 +14,7 @@ describe("management settings wire", () => {
 		expect(pushSettings).not.toHaveBeenCalled();
 	});
 
-	it("forwards skill catalog and code mode preferences without losing explicit false or zero", () => {
+	it("forwards settings without losing explicit false or zero", () => {
 		const setSettings = vi.fn();
 		const patch = {
 			skillsCatalogMaxDesc: 0,
@@ -22,6 +22,7 @@ describe("management settings wire", () => {
 			skillsCatalogBudget: 1600,
 			codemodeMode: "only" as const,
 			codemodeInlineBudget: 800,
+			thinkingPreviewEnabled: false,
 		};
 		const msg: ClientMessage = { type: "set_settings", ...patch };
 		expect(handleSettingsMessage(msg, { setSettings } as unknown as DispatchSession)).toBe(true);

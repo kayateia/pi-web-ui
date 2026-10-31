@@ -713,6 +713,7 @@ export function handleSettingsMessage(
 				parallelReminderEnabled: (msg as { parallelReminderEnabled?: boolean }).parallelReminderEnabled,
 				goalModeEnabled: (msg as { goalModeEnabled?: boolean }).goalModeEnabled,
 				thinkingWrap: msg.thinkingWrap,
+				thinkingPreviewEnabled: (msg as { thinkingPreviewEnabled?: boolean }).thinkingPreviewEnabled,
 				toolsWrap: msg.toolsWrap,
 				toolImagesEnabled: (msg as { toolImagesEnabled?: boolean }).toolImagesEnabled,
 				keepRecentMessages: (msg as { keepRecentMessages?: number }).keepRecentMessages,
