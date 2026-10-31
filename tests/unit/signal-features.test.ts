@@ -14,6 +14,7 @@ import {
 	normalizeConfig,
 	normalizeSenderId,
 	parseSignalEnvelope,
+	renderSignalMentions,
 	resolveChannelProfile,
 	signalRecipient,
 } from "../../plugins/signal/index.mjs";
@@ -41,6 +42,13 @@ function directEnvelope(body = "hello"): {
 				filename?: string;
 				size?: number;
 				caption?: string;
+			}>;
+			mentions?: Array<{
+				name?: string;
+				number?: string;
+				uuid?: string;
+				start: number;
+				length: number;
 			}>;
 		};
 	};
@@ -148,6 +156,21 @@ describe("Signal envelope parsing", () => {
 			],
 		});
 	});
+
+	it("preserves mention metadata from Signal bodies", () => {
+		const raw = directEnvelope("Hi \uFFFC");
+		raw.envelope.dataMessage.mentions = [{ uuid: aliceUuid, number: "+14165559876", start: 3, length: 1 }];
+		const parsed = parseSignalEnvelope(raw, { account, accountUuid });
+		expect(parsed?.mentions).toEqual([
+			{
+				name: "",
+				number: "+14165559876",
+				uuid: `aci:${aliceUuid}`,
+				start: 3,
+				length: 1,
+			},
+		]);
+	});
 });
 
 describe("Signal authorization and channel profiles", () => {
@@ -254,6 +277,41 @@ describe("Signal delivery helpers", () => {
 		expect(signalRecipient(`aci:${aliceUuid}`)).toBe(aliceUuid);
 		expect(signalRecipient("e164:+14165559876")).toBe("+14165559876");
 		expect(signalRecipient(aliceUuid)).toBe(aliceUuid);
+	});
+
+	it("renders mention placeholders as readable @handles", () => {
+		const body = "Hi \uFFFC, meet \uFFFC";
+		const rendered = renderSignalMentions(
+			body,
+			[
+				{ uuid: `aci:${aliceUuid}`, start: 3, length: 1 },
+				{ number: "+14165550000", start: 11, length: 1 },
+			],
+			(mention: { uuid?: string; number?: string }) => (mention.uuid ? "Alice" : "Bob"),
+		);
+		expect(rendered).toBe("Hi @Alice, meet @Bob");
+	});
+
+	it("resolves mention names from signal-cli contacts", async () => {
+		const raw = directEnvelope("hello \uFFFC");
+		raw.envelope.dataMessage.mentions = [{ uuid: aliceUuid, start: 6, length: 1 }];
+		const parsed = parseSignalEnvelope(raw, { account, accountUuid })!;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					jsonrpc: "2.0",
+					id: 1,
+					result: [{ uuid: aliceUuid, number: "+14165559876", profileName: "Alice" }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+		const gateway = new SignalGateway({ host: {}, getConfig: () => normalizeConfig({}) });
+		gateway.status.account = account;
+		gateway.daemonUrl = "http://127.0.0.1:8080";
+		const body = await gateway.resolveInboundBody(parsed);
+		fetchSpy.mockRestore();
+		expect(body).toBe("hello @Alice");
 	});
 
 	it("chunks long replies without losing content", () => {

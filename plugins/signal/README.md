@@ -4,6 +4,8 @@ Connect a full signal-cli account to pi-web-ui. Incoming DMs and groups are
 authorized per sender, mapped to dedicated pi-web-ui conversations, and answered
 in the originating channel. Image attachments are downloaded through
 signal-cli's `getAttachment` RPC and forwarded as normal pi-web-ui image content.
+Signal `@mentions` are resolved against known contacts and rendered as readable
+`@Display Name` text in the conversation.
 
 ## Requirements
 

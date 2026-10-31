@@ -130,7 +130,43 @@ function messagePayload(dataMessage) {
 				}))
 				.filter((attachment) => attachment.id && attachment.contentType)
 		: [];
-	return { body: body.trim(), timestamp, attachments };
+	const mentions = Array.isArray(dataMessage?.mentions)
+		? dataMessage.mentions
+				.filter((mention) => mention && typeof mention === "object")
+				.map((mention) => ({
+					name: sanitizeSignalName(mention.name),
+					number: normalizePhone(mention.number),
+					uuid: normalizeSenderId(mention.uuid),
+					start: Number.isInteger(mention.start) ? mention.start : -1,
+					length: Number.isInteger(mention.length) ? mention.length : 0,
+				}))
+				.filter((mention) => mention.start >= 0 && mention.length > 0)
+		: [];
+	return { body: body.trim(), timestamp, attachments, mentions };
+}
+
+/**
+ * Replace signal-cli mention placeholder spans with readable `@handle` text.
+ *
+ * signal-cli exposes mention targets as metadata and leaves U+FFFC (object
+ * replacement character) in the message body. Replacing from the end keeps
+ * earlier UTF-16 offsets stable.
+ */
+export function renderSignalMentions(body, mentions, resolveHandle) {
+	let rendered = String(body ?? "");
+	const ordered = (Array.isArray(mentions) ? mentions : [])
+		.filter((mention) => mention.start >= 0 && mention.length > 0)
+		.slice()
+		.sort((left, right) => right.start - left.start);
+	for (const mention of ordered) {
+		if (mention.start + mention.length > rendered.length) continue;
+		const resolved = sanitizeSignalName(resolveHandle?.(mention));
+		const fallback = mention.name || signalRecipient(mention.uuid) || mention.number || "unknown";
+		const handle = resolved || fallback;
+		const replacement = handle.startsWith("@") ? handle : `@${handle}`;
+		rendered = rendered.slice(0, mention.start) + replacement + rendered.slice(mention.start + mention.length);
+	}
+	return rendered;
 }
 
 /**
@@ -177,6 +213,7 @@ export function parseSignalEnvelope(raw, opts) {
 			body: payload.body,
 			timestamp: payload.timestamp,
 			attachments: payload.attachments,
+			mentions: payload.mentions,
 			sender: {
 				name: senderName || aci || number || "Unknown sender",
 				ids: senderIds,
@@ -211,6 +248,7 @@ export function parseSignalEnvelope(raw, opts) {
 		body: payload.body,
 		timestamp: payload.timestamp,
 		attachments: payload.attachments,
+		mentions: payload.mentions,
 		sender: {
 			name: "Self",
 			ids: [...ownIds],
@@ -401,6 +439,8 @@ export class SignalGateway {
 		this.pendingRuns = new Map();
 		this.sessionMap = { ...this.getSessionMap() };
 		this.discovered = new Map();
+		this.mentionContacts = new Map();
+		this.mentionContactsAt = 0;
 		this.status = {
 			enabled: false,
 			connected: false,
@@ -484,6 +524,47 @@ export class SignalGateway {
 		if (!Array.isArray(contacts)) return "";
 		const match = contacts.find((entry) => normalizePhone(entry?.number) === account);
 		return String(match?.uuid || match?.aci || "").trim();
+	}
+
+	/** Load and cache contact labels used to render Signal @mentions. */
+	async loadMentionContacts() {
+		if (this.mentionContactsAt && Date.now() - this.mentionContactsAt < 5 * 60_000) {
+			return this.mentionContacts;
+		}
+		const contacts = await daemonRpc(this.daemonUrl, "listContacts", {
+			account: this.status.account,
+			allRecipients: true,
+		});
+		const directory = new Map();
+		if (Array.isArray(contacts)) {
+			for (const contact of contacts) {
+				const name = sanitizeSignalName(
+					contact?.name ||
+						contact?.profileName ||
+						[contact?.givenName, contact?.familyName].filter(Boolean).join(" ") ||
+						contact?.username,
+				);
+				if (!name) continue;
+				for (const identity of [
+					normalizeSenderId(contact?.uuid || contact?.aci),
+					normalizePhone(contact?.number),
+				].filter(Boolean)) {
+					directory.set(identity, name);
+				}
+			}
+		}
+		this.mentionContacts = directory;
+		this.mentionContactsAt = Date.now();
+		return directory;
+	}
+
+	/** Resolve Signal mention metadata into readable @Display Name text. */
+	async resolveInboundBody(parsed) {
+		if (!Array.isArray(parsed.mentions) || parsed.mentions.length === 0) return parsed.body;
+		const contacts = await this.loadMentionContacts().catch(() => new Map());
+		return renderSignalMentions(parsed.body, parsed.mentions, (mention) => {
+			return contacts.get(mention.uuid) || contacts.get(mention.number);
+		});
 	}
 
 	connectSse() {
@@ -731,7 +812,8 @@ export class SignalGateway {
 			) {
 				throw new Error(`could not load Signal image attachment: ${imageErrors.join("; ")}`);
 			}
-			const body = parsed.body || (images.length > 0 ? "Sent an image." : "Empty message.");
+			const resolvedBody = await this.resolveInboundBody(parsed);
+			const body = resolvedBody || (images.length > 0 ? "Sent an image." : "Empty message.");
 			const captions = images
 				.map((image) => image.caption?.trim())
 				.filter(Boolean)
