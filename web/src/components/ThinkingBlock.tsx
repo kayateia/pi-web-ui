@@ -123,6 +123,8 @@ export function ThinkingBlock({
 	const expanded = open ?? (wrap && previewEnabled);
 	// 搜索期间 forceOpen 只是“视口展开”，用户 open 状态不受影响
 	const shown = expanded || forceOpen;
+	// 折叠且关闭预览时不渲染也不播放思考文本；该状态同时决定是否需要余韵动画。
+	const showThinkingText = shown || previewEnabled;
 
 	// 余韵收尾（Graceful Tail Drain）：短思考紧接着触发 toolCall 时，streaming 会迅速变为 false；
 	// 保持 draining 直至缓冲池内的文字平滑流淌完毕，防止短思考没有过程就直接全部蹦出。
@@ -132,11 +134,11 @@ export function ThinkingBlock({
 	const liveRef = useRef(live);
 	liveRef.current = live;
 	const isHidden = () => typeof document !== "undefined" && document.hidden;
-	const [draining, setDraining] = useState(() => live && !isHidden());
+	const [draining, setDraining] = useState(() => live && !isHidden() && showThinkingText);
 	useEffect(() => {
-		if (live && !isHidden()) setDraining(true);
-		else if (!live && isHidden()) setDraining(false);
-	}, [live]);
+		if (live && !isHidden() && showThinkingText) setDraining(true);
+		else if (!live || isHidden() || !showThinkingText) setDraining(false);
+	}, [live, showThinkingText]);
 	useEffect(() => {
 		if (typeof document === "undefined") return;
 		const onVis = () => {
@@ -148,10 +150,9 @@ export function ThinkingBlock({
 	const handleStreamSettled = useCallback(() => {
 		if (!liveRef.current) setDraining(false);
 	}, []);
-	const activeStream = live || draining;
+	const activeStream = live || (draining && showThinkingText);
 
 	// 折叠且关闭预览时跳过平滑流处理：既不渲染跑马灯，也不在后台推进逐字动画。
-	const showThinkingText = shown || previewEnabled;
 	const displayedThinking = useSmoothStreamText(
 		thinking,
 		showThinkingText && activeStream,

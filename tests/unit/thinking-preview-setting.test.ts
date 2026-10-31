@@ -35,6 +35,24 @@ function mount(thinking: string, previewEnabled: boolean, streaming = false, wra
 	return container;
 }
 
+function update(thinking: string, previewEnabled: boolean, streaming = false, wrap = false): void {
+	if (!root) throw new Error("thinking block is not mounted");
+	act(() => {
+		root!.render(
+			createElement(
+				LanguageProvider,
+				null,
+				createElement(ThinkingBlock, {
+					thinking,
+					streaming,
+					wrap,
+					previewEnabled,
+				}),
+			),
+		);
+	});
+}
+
 function toggle(container: HTMLDivElement): void {
 	const button = container.querySelector<HTMLButtonElement>(".thinking-toggle");
 	if (!button) throw new Error("thinking toggle not found");
@@ -79,6 +97,18 @@ describe("quiet collapsed thinking", () => {
 		expect(container.querySelector(".thinking-live-label")).not.toBeNull();
 		expect(container.querySelector(".thinking-preview-live")).toBeNull();
 		expect(container.querySelector(".thinking-preview-track")).toBeNull();
+	});
+
+	it("clears the active indicator when quiet streaming finishes", () => {
+		const container = mount("Finished reasoning", false, true);
+		expect(container.querySelector(".thinking.run")).not.toBeNull();
+		expect(container.querySelector(".thinking-live-label")).not.toBeNull();
+
+		update("Finished reasoning", false, false);
+
+		expect(container.querySelector(".thinking.ok")).not.toBeNull();
+		expect(container.querySelector(".thinking.run, .thinking-live-label, .spin, .dots")).toBeNull();
+		expect(container.textContent).not.toContain("Finished reasoning");
 	});
 
 	it("keeps quiet thinking collapsed even when full thinking is enabled", () => {
