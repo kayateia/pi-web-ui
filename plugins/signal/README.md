@@ -2,7 +2,8 @@
 
 Connect a full signal-cli account to pi-web-ui. Incoming DMs and groups are
 authorized per sender, mapped to dedicated pi-web-ui conversations, and answered
-in the originating channel.
+in the originating channel. Image attachments are downloaded through
+signal-cli's `getAttachment` RPC and forwarded as normal pi-web-ui image content.
 
 ## Requirements
 
@@ -19,6 +20,7 @@ are documented at <https://github.com/aalzubidy/pi-signal>.
 - ACI/service IDs are preferred over phone numbers.
 - Group channels must be explicitly enabled.
 - The daemon URL is loopback-only by default.
+- Image attachments are limited to six images, 5 MiB each, and 12 MiB total.
 - Each channel can use a separate workspace, preset, model, tool profile, and
   system prompt.
 

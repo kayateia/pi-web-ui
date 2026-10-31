@@ -16,6 +16,8 @@ const SSE_RETRY_MAX_MS = 60_000;
 const SIGNAL_CHUNK_CHARS = 7_800;
 const MAX_SEEN_ENVELOPES = 2_000;
 const RUN_TIMEOUT_MS = 20 * 60_000;
+const MAX_SIGNAL_IMAGES = 6;
+const MAX_SIGNAL_IMAGE_BYTES = 5 * 1024 * 1024;
 
 /** Remove pi-web-ui internal side-effect markers before leaving the host. */
 export function stripInternalMarkers(text) {
@@ -104,7 +106,7 @@ export function envelopeSenderIds(envelope) {
 	return [...new Set(values.map(normalizeSenderId).filter(Boolean))];
 }
 
-/** Text and timestamp for direct or synced messages. */
+/** Text, timestamp, and attachment metadata for direct or synced messages. */
 function messagePayload(dataMessage) {
 	const body =
 		typeof dataMessage?.message === "string"
@@ -114,7 +116,21 @@ function messagePayload(dataMessage) {
 				: "";
 	const timestamp =
 		typeof dataMessage?.timestamp === "number" && Number.isFinite(dataMessage.timestamp) ? dataMessage.timestamp : 0;
-	return { body: body.trim(), timestamp };
+	const attachments = Array.isArray(dataMessage?.attachments)
+		? dataMessage.attachments
+				.filter((attachment) => attachment && typeof attachment === "object")
+				.map((attachment) => ({
+					id: typeof attachment.id === "string" ? attachment.id.trim() : "",
+					contentType: typeof attachment.contentType === "string" ? attachment.contentType.trim().toLowerCase() : "",
+					filename: sanitizeSignalName(attachment.filename),
+					size: Number.isFinite(attachment.size) ? Number(attachment.size) : 0,
+					caption: String(attachment.caption ?? "")
+						.trim()
+						.slice(0, 2_000),
+				}))
+				.filter((attachment) => attachment.id && attachment.contentType)
+		: [];
+	return { body: body.trim(), timestamp, attachments };
 }
 
 /**
@@ -132,7 +148,7 @@ export function parseSignalEnvelope(raw, opts) {
 	const dataMessage = envelope.dataMessage;
 	if (dataMessage && typeof dataMessage === "object") {
 		const payload = messagePayload(dataMessage);
-		if (!payload.body) return null;
+		if (!payload.body && payload.attachments.length === 0) return null;
 		const senderIds = envelopeSenderIds(envelope);
 		if (senderIds.some((id) => ownIds.has(id))) return null;
 
@@ -160,6 +176,7 @@ export function parseSignalEnvelope(raw, opts) {
 			...channel,
 			body: payload.body,
 			timestamp: payload.timestamp,
+			attachments: payload.attachments,
 			sender: {
 				name: senderName || aci || number || "Unknown sender",
 				ids: senderIds,
@@ -179,7 +196,7 @@ export function parseSignalEnvelope(raw, opts) {
 	const sentMessage = envelope.syncMessage?.sentMessage;
 	if (!sentMessage || typeof sentMessage !== "object") return null;
 	const payload = messagePayload(sentMessage);
-	if (!payload.body) return null;
+	if (!payload.body && payload.attachments.length === 0) return null;
 	const destinationIds = [sentMessage.destinationNumber, sentMessage.destinationUuid, sentMessage.destination]
 		.filter(Boolean)
 		.map(normalizeSenderId)
@@ -193,6 +210,7 @@ export function parseSignalEnvelope(raw, opts) {
 		groupId: "",
 		body: payload.body,
 		timestamp: payload.timestamp,
+		attachments: payload.attachments,
 		sender: {
 			name: "Self",
 			ids: [...ownIds],
@@ -646,12 +664,86 @@ export class SignalGateway {
 		return result;
 	}
 
+	/**
+	 * Download image attachments already received by signal-cli.
+	 *
+	 * signal-cli's `getAttachment` RPC returns `{data}` where data is base64.
+	 * DM retrieval is scoped to the sender; group retrieval is scoped to the
+	 * group ID, matching signal-cli's CLI/RPC contract.
+	 */
+	async resolveInboundImages(parsed) {
+		const images = [];
+		const errors = [];
+		const attachments = Array.isArray(parsed.attachments)
+			? parsed.attachments.filter((attachment) => String(attachment.contentType).startsWith("image/"))
+			: [];
+		for (const [index, attachment] of attachments.slice(0, MAX_SIGNAL_IMAGES).entries()) {
+			const displayName =
+				sanitizeSignalName(attachment.filename) ||
+				`signal-image-${parsed.timestamp || Date.now()}-${index + 1}.${attachment.contentType.split("/")[1] || "img"}`;
+			try {
+				const params = {
+					account: this.status.account,
+					id: attachment.id,
+				};
+				if (parsed.kind === "group") params.groupId = parsed.groupId;
+				else {
+					params.recipient = signalRecipient(
+						parsed.sender.aci || parsed.envelope.sourceUuid || parsed.sender.number || this.status.account,
+					);
+				}
+				const result = await daemonRpc(this.daemonUrl, "getAttachment", params);
+				const raw = typeof result === "string" ? result : String(result?.data ?? "");
+				const imageData = raw.replace(/^data:[^;]+;base64,/, "").replace(/\s+/g, "");
+				if (!imageData) throw new Error("signal-cli returned an empty attachment");
+				const bytes = Buffer.byteLength(imageData, "base64");
+				if (bytes <= 0) throw new Error("decoded attachment is empty");
+				if (bytes > MAX_SIGNAL_IMAGE_BYTES) {
+					throw new Error(
+						`image is too large (${Math.ceil(bytes / 1024 / 1024)} MiB; limit ${MAX_SIGNAL_IMAGE_BYTES / 1024 / 1024} MiB)`,
+					);
+				}
+				images.push({
+					name: displayName,
+					mimeType: attachment.contentType,
+					imageData,
+					caption: attachment.caption,
+				});
+			} catch (error) {
+				errors.push(`${displayName}: ${formatSignalError(error)}`);
+			}
+		}
+		if (attachments.length > MAX_SIGNAL_IMAGES) {
+			errors.push(`only the first ${MAX_SIGNAL_IMAGES} images were included`);
+		}
+		return { images, errors };
+	}
+
 	async processInbound(parsed, channelConfig) {
 		let pending;
 		try {
 			const binding = await this.ensureConversation(parsed, channelConfig);
 			const conversationId = binding.conversationId;
-			const promptText = `[Signal ${parsed.kind === "group" ? "group" : "DM"} · ${parsed.sender.name}]: ${parsed.body}`;
+			const { images, errors: imageErrors } = await this.resolveInboundImages(parsed);
+			if (
+				parsed.attachments?.some((attachment) => attachment.contentType.startsWith("image/")) &&
+				images.length === 0
+			) {
+				throw new Error(`could not load Signal image attachment: ${imageErrors.join("; ")}`);
+			}
+			const body = parsed.body || (images.length > 0 ? "Sent an image." : "Empty message.");
+			const captions = images
+				.map((image) => image.caption?.trim())
+				.filter(Boolean)
+				.map((caption) => `Image caption: ${caption}`);
+			const imageNotes = [
+				...(images.length > 0 ? [`[${images.length} image attachment${images.length === 1 ? "" : "s"}]`] : []),
+				...captions,
+				...(imageErrors.length > 0 ? [`[Image attachment warnings: ${imageErrors.join("; ")}]`] : []),
+			];
+			const promptText = `[Signal ${parsed.kind === "group" ? "group" : "DM"} · ${parsed.sender.name}]: ${body}${
+				imageNotes.length ? `\n${imageNotes.join("\n")}` : ""
+			}`;
 			pending = {
 				conversationId,
 				parsed,
@@ -674,6 +766,15 @@ export class SignalGateway {
 				accountId: senderAccountId(parsed.sender.channelIds[0] || parsed.key),
 				conversationId,
 				strictConversationId: true,
+				...(images.length > 0
+					? {
+							attachments: images.map(({ name, mimeType, imageData }) => ({
+								name,
+								mimeType,
+								imageData,
+							})),
+						}
+					: {}),
 				...(channelConfig.workspace ? { cwd: channelConfig.workspace } : {}),
 				...(channelConfig.model ? { model: channelConfig.model } : {}),
 				...(channelConfig.thinkingLevel ? { thinkingLevel: channelConfig.thinkingLevel } : {}),

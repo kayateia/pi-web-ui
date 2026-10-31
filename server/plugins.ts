@@ -254,6 +254,64 @@ export interface PluginChatRequest {
 	model?: string;
 	/** 可选：指定思考强度（投递前切换，失败即拒绝不回落）。 */
 	thinkingLevel?: string;
+	/** Optional images forwarded into the mapped conversation. Raw bytes stay
+	 *  base64-encoded so plugins never expose arbitrary host file paths. */
+	attachments?: PluginChatAttachment[];
+}
+
+/** Image attachment accepted from a transport plugin. */
+export interface PluginChatAttachment {
+	/** Display filename shown in the chat transcript. */
+	name?: string;
+	/** Image MIME type, e.g. `image/jpeg`. */
+	mimeType?: string;
+	/** Base64 image bytes without a `data:` prefix. */
+	imageData: string;
+}
+
+const PLUGIN_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"]);
+const PLUGIN_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const PLUGIN_IMAGE_TOTAL_MAX_BYTES = 12 * 1024 * 1024;
+
+/** Validate and copy image attachments supplied by a transport plugin. */
+export function sanitizePluginChatAttachments(value: unknown): PluginChatAttachment[] {
+	if (!Array.isArray(value)) return [];
+	if (value.length > 6) throw new Error("chat: too many image attachments (max 6)");
+	const out: PluginChatAttachment[] = [];
+	let totalBytes = 0;
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object") continue;
+		const raw = entry as Record<string, unknown>;
+		const mimeType = String(raw.mimeType ?? "")
+			.trim()
+			.toLowerCase();
+		if (!PLUGIN_IMAGE_MIME.has(mimeType))
+			throw new Error(`chat: unsupported image MIME type: ${mimeType || "(missing)"}`);
+		const imageData = String(raw.imageData ?? "")
+			.replace(/^data:[^;]+;base64,/, "")
+			.replace(/\s+/g, "");
+		if (!imageData || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
+			throw new Error("chat: image attachment is not valid base64");
+		}
+		const bytes = Buffer.byteLength(imageData, "base64");
+		if (bytes <= 0) throw new Error("chat: image attachment is empty");
+		if (bytes > PLUGIN_IMAGE_MAX_BYTES) throw new Error("chat: image attachment exceeds the 5 MiB limit");
+		totalBytes += bytes;
+		if (totalBytes > PLUGIN_IMAGE_TOTAL_MAX_BYTES) {
+			throw new Error("chat: image attachments exceed the 12 MiB total limit");
+		}
+		const name = String(raw.name ?? "")
+			.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 200);
+		out.push({
+			imageData,
+			mimeType,
+			...(name ? { name } : {}),
+		});
+	}
+	return out;
 }
 
 /** host.chat 的投递回执（运行中，结论经 run_end 事件）。 */
@@ -4080,17 +4138,19 @@ export class PluginManager {
 		const canWrite = (): boolean => self.canUse(info.id, "fs:write");
 		/** 无头调用落地（host.chat 与 host.chatWait 共用）：能力 "chat" 门控 +
 		 *  文本校验 + chatProvider 投递。宿主未接入时拒绝（不抛到插件侧，由调用方包 {ok:false}）。 */
-		const sendChat = (req: PluginChatRequest): Promise<PluginChatResult> => {
+		const sendChat = async (req: PluginChatRequest): Promise<PluginChatResult> => {
 			if (!can("chat")) return Promise.reject(new Error(`插件未声明能力 "chat"（manifest.permissions）——请求被拒`));
 			if (!self.chatProvider) {
 				return Promise.reject(new Error("宿主未提供无头调用（chatProvider 未接入）——请升级 pi-web-ui"));
 			}
 			const text = String((req as PluginChatRequest | undefined)?.text ?? "").trim();
-			if (!text) return Promise.reject(new Error("chat: text 为空"));
-			if (text.length > 8000) return Promise.reject(new Error("chat: text 超长（>8000 字），请裁剪后重发"));
-			const accountId = String((req as PluginChatRequest | undefined)?.accountId ?? "default").slice(0, 64);
-			// issue #226：透传定时任务对齐的四件套（各按长度封顶，语义校验归宿主 chatFromPlugin）。
 			const r = ((req as PluginChatRequest | undefined) ?? {}) as PluginChatRequest;
+			const attachments = sanitizePluginChatAttachments(r.attachments);
+			if (!text && attachments.length === 0) {
+				return Promise.reject(new Error("chat: text and attachments are both empty"));
+			}
+			if (text.length > 8000) return Promise.reject(new Error("chat: text 超长（>8000 字），请裁剪后重发"));
+			const accountId = String(r.accountId ?? "default").slice(0, 64);
 			const passthrough: PluginChatRequest = { text, accountId };
 			const cwd = String(r.cwd ?? "").trim();
 			if (cwd) passthrough.cwd = cwd.slice(0, 1024);
@@ -4101,6 +4161,7 @@ export class PluginManager {
 			if (model) passthrough.model = model.slice(0, 256);
 			const thinkingLevel = String(r.thinkingLevel ?? "").trim();
 			if (thinkingLevel) passthrough.thinkingLevel = thinkingLevel.slice(0, 64);
+			if (attachments.length > 0) passthrough.attachments = attachments;
 			return self.chatProvider(info.id, passthrough);
 		};
 		let pluginAbort: AbortController | null = null;

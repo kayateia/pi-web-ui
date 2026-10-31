@@ -188,6 +188,14 @@ export interface PluginConversationEnsureResult {
 	error?: string;
 }
 
+/** Image attachment forwarded into a mapped conversation. */
+export interface PluginChatAttachment {
+	name?: string;
+	mimeType?: string;
+	/** Base64 image bytes without a `data:` prefix. */
+	imageData: string;
+}
+
 /** 工具拦截守卫看到的 pre 请求（只对 bash/read 生效，全量见 server/plugin-tool-guard.ts）。 */
 export interface ToolGuardPreRequest {
 	toolName: "bash" | "read";
@@ -332,6 +340,7 @@ export interface PluginHost {
 		strictConversationId?: boolean;
 		model?: string;
 		thinkingLevel?: string;
+		attachments?: PluginChatAttachment[];
 	}): Promise<{
 		ok: boolean;
 		conversationId?: string;
@@ -347,6 +356,7 @@ export interface PluginHost {
 			strictConversationId?: boolean;
 			model?: string;
 			thinkingLevel?: string;
+			attachments?: PluginChatAttachment[];
 		},
 		opts?: { timeoutMs?: number },
 	): Promise<{ ok: boolean; conversationId?: string; error?: string }>;

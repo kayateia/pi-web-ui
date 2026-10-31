@@ -35,6 +35,13 @@ function directEnvelope(body = "hello"): {
 			body: string;
 			timestamp: number;
 			groupInfo?: { groupId: string; groupName: string };
+			attachments?: Array<{
+				id: string;
+				contentType: string;
+				filename?: string;
+				size?: number;
+				caption?: string;
+			}>;
 		};
 	};
 } {
@@ -114,6 +121,32 @@ describe("Signal envelope parsing", () => {
 		raw.envelope.sourceUuid = accountUuid;
 		raw.envelope.sourceNumber = account;
 		expect(parseSignalEnvelope(raw, { account, accountUuid })).toBeNull();
+	});
+
+	it("keeps image-only messages and their attachment metadata", () => {
+		const raw = directEnvelope("");
+		raw.envelope.dataMessage.attachments = [
+			{
+				id: "attachment-1",
+				contentType: "image/jpeg",
+				filename: "photo.jpg",
+				size: 1234,
+				caption: "A view",
+			},
+		];
+		const parsed = parseSignalEnvelope(raw, { account, accountUuid });
+		expect(parsed).toMatchObject({
+			body: "",
+			attachments: [
+				{
+					id: "attachment-1",
+					contentType: "image/jpeg",
+					filename: "photo.jpg",
+					size: 1234,
+					caption: "A view",
+				},
+			],
+		});
 	});
 });
 
@@ -215,6 +248,53 @@ describe("Signal delivery helpers", () => {
 		expect(chunks.join("\n\n")).toBe(text);
 	});
 
+	it("downloads Signal image attachments through getAttachment", async () => {
+		const raw = directEnvelope("");
+		raw.envelope.dataMessage.attachments = [
+			{
+				id: "attachment-1",
+				contentType: "image/png",
+				filename: "photo.png",
+				size: 4,
+			},
+		];
+		const parsed = parseSignalEnvelope(raw, { account, accountUuid })!;
+		const imageData = Buffer.from("PNG!").toString("base64");
+		let rpcBody: Record<string, unknown> | undefined;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+			rpcBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+			return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { data: imageData } }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const gateway = new SignalGateway({
+			host: {},
+			getConfig: () => normalizeConfig({}),
+		});
+		gateway.status.account = account;
+		gateway.daemonUrl = "http://127.0.0.1:8080";
+		const result = await gateway.resolveInboundImages(parsed);
+		fetchSpy.mockRestore();
+		expect(result.errors).toEqual([]);
+		expect(result.images).toEqual([
+			{
+				name: "photo.png",
+				mimeType: "image/png",
+				imageData,
+				caption: "",
+			},
+		]);
+		expect(rpcBody).toMatchObject({
+			method: "getAttachment",
+			params: {
+				account,
+				id: "attachment-1",
+				recipient: aliceUuid,
+			},
+		});
+	});
+
 	it("associates a completed run with exactly one Signal reply", async () => {
 		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
 		const gateway = new SignalGateway({
@@ -282,6 +362,64 @@ describe("Signal delivery helpers", () => {
 		expect(String(captured?.systemPrompt).indexOf("global layer")).toBeLessThan(
 			String(captured?.systemPrompt).indexOf("channel layer"),
 		);
+	});
+
+	it("forwards downloaded images into the mapped pi-web-ui conversation", async () => {
+		const raw = directEnvelope("");
+		raw.envelope.dataMessage.attachments = [
+			{
+				id: "attachment-1",
+				contentType: "image/png",
+				filename: "photo.png",
+			},
+		];
+		const parsed = parseSignalEnvelope(raw, { account, accountUuid })!;
+		const config = normalizeConfig({
+			allowedSenders: [`aci:${aliceUuid}`],
+			channels: { [parsed.key]: { enabled: true } },
+		});
+		const profile = resolveChannelProfile(parsed, config)!;
+		let chatRequest: Record<string, unknown> | undefined;
+		const gateway = new SignalGateway({
+			host: {
+				conversations: {
+					ensure: async () => ({ ok: true, conversationId: "c1" }),
+				},
+				chat: async (request: Record<string, unknown>) => {
+					chatRequest = request;
+					return { conversationId: "c1", clientId: "signal" };
+				},
+			},
+			getConfig: () => config,
+			setSessionMap: async () => {},
+		});
+		gateway.status.account = account;
+		gateway.resolveInboundImages = async () => ({
+			images: [
+				{
+					name: "photo.png",
+					mimeType: "image/png",
+					imageData: "UE5HIQ==",
+					caption: "",
+				},
+			],
+			errors: [],
+		});
+		await gateway.processInbound(parsed, profile);
+		for (const pending of gateway.pendingRuns.values()) clearTimeout(pending.timeout);
+		gateway.pendingRuns.clear();
+		expect(chatRequest).toMatchObject({
+			conversationId: "c1",
+			strictConversationId: true,
+			attachments: [
+				{
+					name: "photo.png",
+					mimeType: "image/png",
+					imageData: "UE5HIQ==",
+				},
+			],
+		});
+		expect(String(chatRequest?.text)).toContain("1 image attachment");
 	});
 });
 

@@ -129,6 +129,35 @@ describe("host.chat 四件套透传（issue #226）", () => {
 			strictConversationId: true,
 		});
 	});
+	it("validated image attachments are forwarded and may accompany empty text", async () => {
+		makeChatter("imagechat", ["chat"]);
+		let got: PluginChatRequest | undefined;
+		mgr.chatProvider = async (_pluginId, req) => {
+			got = req;
+			return { conversationId: "c1", clientId: "x" };
+		};
+		const imageData = Buffer.from("not-a-real-png").toString("base64");
+		const host = await chatHost();
+		await host.chat({
+			text: "",
+			accountId: "signal-peer",
+			conversationId: "c1",
+			strictConversationId: true,
+			attachments: [{ name: "photo.png", mimeType: "image/png", imageData }],
+		});
+		expect(got?.attachments).toEqual([{ name: "photo.png", mimeType: "image/png", imageData }]);
+	});
+	it("rejects unsupported image attachment types", async () => {
+		makeChatter("badimage", ["chat"]);
+		mgr.chatProvider = async () => ({ conversationId: "c1", clientId: "x" });
+		const host = await chatHost();
+		await expect(
+			host.chat({
+				text: "image",
+				attachments: [{ mimeType: "text/html", imageData: "PGgxPg==" }],
+			}),
+		).rejects.toThrow(/unsupported image MIME/);
+	});
 	it("不传四件套时只发 text+accountId（老插件语义不变）", async () => {
 		makeChatter("chatter", ["chat"]);
 		let got: PluginChatRequest | undefined;

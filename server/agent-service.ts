@@ -4923,6 +4923,7 @@ export class ClientSession {
 	async trySteerScheduler(
 		conv: Conversation,
 		text: string,
+		images?: Array<{ type: "image"; data: string; mimeType: string }>,
 	): Promise<{ ok: true } | { ok: false; busy: boolean; error?: string }> {
 		try {
 			try {
@@ -4932,7 +4933,14 @@ export class ClientSession {
 			} catch {
 				/* 读不到压缩态就直接投递，失败按异常走 */
 			}
-			await conv.session.sendUserMessage(text, conv.session.isStreaming ? { deliverAs: "steer" } : undefined);
+			if (images && images.length > 0) {
+				await conv.session.prompt(text, {
+					images,
+					...(conv.session.isStreaming ? { streamingBehavior: "steer" as const } : {}),
+				});
+			} else {
+				await conv.session.sendUserMessage(text, conv.session.isStreaming ? { deliverAs: "steer" } : undefined);
+			}
 			return { ok: true };
 		} catch (err) {
 			const msg = String((err as Error)?.message ?? err);
