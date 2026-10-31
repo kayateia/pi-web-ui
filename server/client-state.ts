@@ -413,6 +413,9 @@ export interface ClientSettings {
 	/** 思考块默认折叠与否（默认关 = 折叠；开 = 始终完整展开并自动换行，流式推理
 	 *  也实时可见）。纯 UI 偏好，与视觉桥 / disabledPlugins 一样不进预设。 */
 	thinkingWrap: boolean;
+	/** 思考块折叠时是否显示单行实时预览（默认开，保持历史行为）。关 → 折叠态只
+	 *  保留卡头与展开箭头，推理正文和滚动预览都隐藏，直到用户主动展开。 */
+	thinkingPreviewEnabled: boolean;
 	/** 开发模式：index.html 不缓存（源码运行默认开，安装包默认关）。 */
 	devNoCache?: boolean;
 	/** 新构建就绪自动重载页面（源码运行默认开，安装包默认关）。 */
@@ -1231,6 +1234,7 @@ export class ClientStateStore {
 			goalModeEnabled: stored?.goalModeEnabled ?? true,
 			parallelReminderEnabled: stored?.parallelReminderEnabled ?? true,
 			thinkingWrap: stored?.thinkingWrap ?? false,
+			thinkingPreviewEnabled: stored?.thinkingPreviewEnabled ?? true,
 			devNoCache: stored?.devNoCache,
 			autoReload: stored?.autoReload,
 			toolsWrap: stored?.toolsWrap ?? true,
@@ -1322,6 +1326,7 @@ export class ClientStateStore {
 			goalModeEnabled: settings.goalModeEnabled ?? cur.goalModeEnabled ?? true,
 			parallelReminderEnabled: settings.parallelReminderEnabled ?? cur.parallelReminderEnabled ?? true,
 			thinkingWrap: settings.thinkingWrap ?? cur.thinkingWrap ?? false,
+			thinkingPreviewEnabled: settings.thinkingPreviewEnabled ?? cur.thinkingPreviewEnabled ?? true,
 			devNoCache: settings.devNoCache ?? cur.devNoCache,
 			autoReload: settings.autoReload ?? cur.autoReload,
 			toolsWrap: settings.toolsWrap ?? cur.toolsWrap ?? true,

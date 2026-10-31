@@ -100,17 +100,27 @@ interface ThinkingBlockProps {
 	 *  （流式推理过程也实时可见）；false（关）→ 折叠成一行摘要，流式中一行
 	 *  实时显示最新文本。 */
 	wrap?: boolean;
+	/** 折叠态是否显示单行实时预览。false → 卡头不展示推理文本，直到用户展开。 */
+	previewEnabled?: boolean;
 	/** 会话内搜索打开时强制展开（折叠内容不在 DOM，搜索索引搜到的词会
 	 *  “展开后看不到”）。不改变用户的 open 状态，关闭搜索自动恢复。 */
 	forceOpen?: boolean;
 }
 
-export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = false }: ThinkingBlockProps) {
+export function ThinkingBlock({
+	thinking,
+	streaming,
+	wrap = true,
+	previewEnabled = true,
+	forceOpen = false,
+}: ThinkingBlockProps) {
 	const t = useT();
 	// null = 未手动点过 → 跟随开关：wrap=true（开）→ 完整展开；wrap=false（关）→ 折叠。
 	// 流式与结束后行为一致——不再出现「流式折叠、结束后又自动展开」的跳动。
 	const [open, setOpen] = useState<boolean | null>(null);
-	const expanded = open ?? wrap;
+	// Quiet mode is authoritative: even when "Show full thinking" is enabled,
+	// reasoning remains collapsed until the user explicitly opens this block.
+	const expanded = open ?? (wrap && previewEnabled);
 	// 搜索期间 forceOpen 只是“视口展开”，用户 open 状态不受影响
 	const shown = expanded || forceOpen;
 
@@ -140,10 +150,17 @@ export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = fa
 	}, []);
 	const activeStream = live || draining;
 
-	const displayedThinking = useSmoothStreamText(thinking, activeStream, !live && draining, handleStreamSettled);
+	// 折叠且关闭预览时跳过平滑流处理：既不渲染跑马灯，也不在后台推进逐字动画。
+	const showThinkingText = shown || previewEnabled;
+	const displayedThinking = useSmoothStreamText(
+		thinking,
+		showThinkingText && activeStream,
+		showThinkingText && !live && draining,
+		handleStreamSettled,
+	);
 	const bodyText = formatThinkingBody(displayedThinking);
 	// 折叠预览：流式中取最新文本（实时最后一行），结束后取首句实质思路。
-	const preview = thinkingPreview(displayedThinking, activeStream);
+	const preview = previewEnabled ? thinkingPreview(displayedThinking, activeStream) : "";
 	const { copied, copy } = useCopyFeedback({ duration: 1200 });
 	const copyThinking = () => {
 		void copy(thinking);

@@ -93,6 +93,7 @@ export const PRESET_FIELD_GROUPS = {
 		"uiLayout",
 		"disabledPlugins",
 		"thinkingWrap",
+		"thinkingPreviewEnabled",
 		"toolsWrap",
 		"toolImagesEnabled",
 		"keepRecentMessages",
@@ -503,6 +504,12 @@ export const PRESET_FIELD_META = {
 		labelEn: "Thinking Block Word Wrap",
 		hintZh: "思考展开区长文本是否自动折行",
 		hintEn: "Enable word wrap inside thinking blocks",
+	},
+	thinkingPreviewEnabled: {
+		labelZh: "折叠思考预览",
+		labelEn: "Collapsed Thinking Preview",
+		hintZh: "思考折叠时是否显示单行实时预览；关闭后仅在展开时显示推理正文",
+		hintEn: "Show a one-line live preview while thinking is collapsed; hide reasoning until expanded when off",
 	},
 	toolsWrap: {
 		labelZh: "工具调用自动折行",
