@@ -6,7 +6,7 @@
  * 「别的项目」，顶上闪一下项目名再消失。含当前对话的组必须直接算当前项目。
  */
 import { describe, expect, it } from "vitest";
-import { buildConversationRows, groupConversations } from "../../web/src/conv-groups.js";
+import { buildConversationRows, groupByConversationCategory, groupConversations } from "../../web/src/conv-groups.js";
 import type { ConversationSummary } from "../../web/src/types.js";
 
 const conv = (id: string, cwd: string, extra: Partial<ConversationSummary> = {}): ConversationSummary => ({
@@ -115,6 +115,37 @@ describe("groupConversations", () => {
 
 	it("空列表 → 空分组", () => {
 		expect(groupConversations([], A, "")).toEqual([]);
+	});
+});
+
+describe("groupByConversationCategory", () => {
+	const categories = [
+		{ id: "work", name: "Work", order: 0 },
+		{ id: "home", name: "Home", order: 1 },
+	];
+
+	it("orders categories, sorts pinned first, and keeps Uncategorized last", () => {
+		const groups = groupByConversationCategory(
+			[
+				conv("uncat", A),
+				conv("home-1", A, { categoryId: "home" }),
+				conv("work-normal", A, { categoryId: "work" }),
+				conv("work-pinned", A, { categoryId: "work", pinned: true }),
+			],
+			categories,
+			true,
+		);
+
+		expect(groups.map((group) => group.id)).toEqual(["work", "home", null]);
+		expect(groups[0].items.map((item) => item.id)).toEqual(["work-pinned", "work-normal"]);
+		expect(groups[1].items.map((item) => item.id)).toEqual(["home-1"]);
+		expect(groups[2].items.map((item) => item.id)).toEqual(["uncat"]);
+	});
+
+	it("hides empty categories for the running list but keeps stale ids in Uncategorized", () => {
+		const groups = groupByConversationCategory([conv("stale", A, { categoryId: "deleted" })], categories, false);
+		expect(groups).toHaveLength(1);
+		expect(groups[0]).toMatchObject({ id: null, items: [expect.objectContaining({ id: "stale" })] });
 	});
 });
 
