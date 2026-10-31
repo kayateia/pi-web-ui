@@ -14,7 +14,7 @@ import { LanguageProvider } from "../../web/src/i18n.js";
 
 let root: Root | null = null;
 
-function mount(thinking: string, previewEnabled: boolean, streaming = false): HTMLDivElement {
+function mount(thinking: string, previewEnabled: boolean, streaming = false, wrap = false): HTMLDivElement {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -26,7 +26,7 @@ function mount(thinking: string, previewEnabled: boolean, streaming = false): HT
 				createElement(ThinkingBlock, {
 					thinking,
 					streaming,
-					wrap: false,
+					wrap,
 					previewEnabled,
 				}),
 			),
@@ -79,6 +79,17 @@ describe("quiet collapsed thinking", () => {
 		expect(container.querySelector(".thinking-live-label")).not.toBeNull();
 		expect(container.querySelector(".thinking-preview-live")).toBeNull();
 		expect(container.querySelector(".thinking-preview-track")).toBeNull();
+	});
+
+	it("keeps quiet thinking collapsed even when full thinking is enabled", () => {
+		const container = mount("Quiet full-thinking text", false, false, true);
+		const thinkingRoot = container.querySelector(".thinking");
+		expect(thinkingRoot?.classList.contains("open")).toBe(false);
+		expect(container.querySelector(".thinking-body")).toBeNull();
+
+		toggle(container);
+
+		expect(container.querySelector(".thinking-body")?.textContent).toContain("Quiet full-thinking text");
 	});
 
 	it("preserves the summary preview when the option stays enabled", () => {
