@@ -9523,6 +9523,7 @@ export class ClientSession {
 		questionTimeoutSeconds?: number;
 		parallelReminderEnabled?: boolean;
 		thinkingWrap?: boolean;
+		thinkingPreviewEnabled?: boolean;
 		toolsWrap?: boolean;
 		toolImagesEnabled?: boolean;
 		showForkedParentSessions?: boolean;

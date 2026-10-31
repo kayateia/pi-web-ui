@@ -1703,6 +1703,8 @@
 		"uploadMaxMbHint": "Maximum size per file, an integer from 1 to 100 MB.",
 		"thinkingWrap": "생각 전체 표시하기",
 		"thinkingWrapDesc": "켜면: 생각 내용이 항상 전부 펼쳐지고 자동 줄바꿈돼요(스트리밍 추론 과정도 실시간으로 보여요). 끄면: 한 줄 요약으로 접히고 스트리밍 중에는 최신 텍스트를 한 줄로 실시간 표시해요",
+		"thinkingPreviewEnabled": "Show thinking preview while collapsed",
+		"thinkingPreviewEnabledDesc": "On: collapsed thinking shows a one-line summary and the latest live reasoning text; Off: only the Think header and expand arrow remain visible until you open the block",
 		"toolsWrap": "도구 전체 표시하기",
 		"toolsWrapDesc": "켜면: 도구 호출이 항상 전부 펼쳐져서 파라미터와 출력을 보여줘요. 끄면: 기본으로 접히고 클릭해서 펼쳐요",
 		"toolImages": "도구 결과 이미지 표시",

@@ -1703,6 +1703,8 @@
 		"uploadMaxMbHint": "Maximum size per file, an integer from 1 to 100 MB.",
 		"thinkingWrap": "Denken vollständig anzeigen",
 		"thinkingWrapDesc": "Aktiviert: Denkinhalte werden stets vollständig ausgeklappt und umbrochen dargestellt (der laufende Schlussfolgerungsprozess ist auch beim Streaming live sichtbar); Deaktiviert: Auf eine einzeilige Zusammenfassung eingeklappt, beim Streaming wird live jeweils der neueste Text in einer Zeile angezeigt",
+		"thinkingPreviewEnabled": "Show thinking preview while collapsed",
+		"thinkingPreviewEnabledDesc": "On: collapsed thinking shows a one-line summary and the latest live reasoning text; Off: only the Think header and expand arrow remain visible until you open the block",
 		"toolsWrap": "Werkzeuge vollständig anzeigen",
 		"toolsWrapDesc": "Aktiviert: Werkzeugaufrufe werden stets vollständig ausgeklappt mit Parametern und Ausgabe angezeigt; Deaktiviert: Standardmäßig eingeklappt, zum Ausklappen anklicken",
 		"toolImages": "Werkzeugbilder direkt anzeigen",

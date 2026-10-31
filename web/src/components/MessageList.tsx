@@ -415,6 +415,8 @@ interface MessageListProps {
 	onRecallQueued?: (kind: "steer" | "followUp", text: string, index: number, id?: string) => void;
 	/** 思考文本是否换行（设置面板开关；false = 不换行横向滚动）。 */
 	thinkingWrap?: boolean;
+	/** 折叠思考块时是否显示单行实时预览。 */
+	thinkingPreviewEnabled?: boolean;
 	/** 工具调用是否默认展开（设置面板开关；false = 默认折叠）。 */
 	toolsWrap?: boolean;
 	/** 工具结果图片直接显示（设置面板开关；false = 不渲染缩略图）。 */
@@ -446,6 +448,7 @@ export function MessageList({
 	onRemoveQueued,
 	onRecallQueued,
 	thinkingWrap,
+	thinkingPreviewEnabled,
 	toolsWrap,
 	toolImages,
 	keepRecent,
@@ -1548,6 +1551,7 @@ export function MessageList({
 											toolsWrap={effectiveToolsWrap}
 											toolImages={toolImages}
 											thinkingWrap={thinkingWrap}
+											thinkingPreviewEnabled={thinkingPreviewEnabled}
 											isLast={m.id === lastId}
 											onEdit={readOnly ? undefined : onEdit}
 											readOnly={readOnly}
@@ -1629,6 +1633,7 @@ export function MessageList({
 								toolsWrap={toolsWrap}
 								toolImages={toolImages}
 								thinkingWrap={thinkingWrap}
+								thinkingPreviewEnabled={thinkingPreviewEnabled}
 								isLast={m.id === lastId}
 								onEdit={readOnly ? undefined : onEdit}
 								readOnly={readOnly}

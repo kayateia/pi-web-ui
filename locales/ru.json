@@ -1703,6 +1703,8 @@
 		"uploadMaxMbHint": "Maximum size per file, an integer from 1 to 100 MB.",
 		"thinkingWrap": "Показывать мышление полностью",
 		"thinkingWrapDesc": "Включено: содержимое мышления всегда полностью раскрыто с переносом строк (процесс рассуждений виден в реальном времени при потоковой передаче); Отключено: сворачивается в однострочную сводку, при потоковой передаче в строке в реальном времени отображается последний текст",
+		"thinkingPreviewEnabled": "Show thinking preview while collapsed",
+		"thinkingPreviewEnabledDesc": "On: collapsed thinking shows a one-line summary and the latest live reasoning text; Off: only the Think header and expand arrow remain visible until you open the block",
 		"toolsWrap": "Показывать инструменты полностью",
 		"toolsWrapDesc": "Включено: вызовы инструментов всегда полностью раскрыты с показом параметров и вывода; Отключено: по умолчанию свернуты, нажмите, чтобы развернуть",
 		"toolImages": "Показывать изображения из инструментов",

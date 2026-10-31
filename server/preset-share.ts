@@ -365,6 +365,7 @@ const PRESET_FIELD_KINDS = {
 	uiLayout: "uiLayout",
 	disabledPlugins: "list",
 	thinkingWrap: "bool",
+	thinkingPreviewEnabled: "bool",
 	toolsWrap: "bool",
 	toolImagesEnabled: "bool",
 	keepRecentMessages: "number",

@@ -1703,6 +1703,8 @@
 		"uploadMaxMbHint": "Maximum size per file, an integer from 1 to 100 MB.",
 		"thinkingWrap": "Düşünmeyi tam göster",
 		"thinkingWrapDesc": "Açık: düşünme içeriği her zaman tam açılır ve satırlara bölünerek gösterilir (akış sırasında canlı akıl yürütme görünür); Kapalı: tek satırlık özete katlanır, akış sırasında en son metin tek satırda canlı gösterilir",
+		"thinkingPreviewEnabled": "Show thinking preview while collapsed",
+		"thinkingPreviewEnabledDesc": "On: collapsed thinking shows a one-line summary and the latest live reasoning text; Off: only the Think header and expand arrow remain visible until you open the block",
 		"toolsWrap": "Araçları tam göster",
 		"toolsWrapDesc": "Açık: araç çağrıları parametreleri ve çıktıyı gösterecek şekilde her zaman tam açılır; Kapalı: varsayılan olarak katlıdır, genişletmek için tıklayın",
 		"toolImages": "Araç sonuç görsellerini doğrudan göster",

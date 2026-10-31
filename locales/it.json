@@ -1703,6 +1703,8 @@
 		"uploadMaxMbHint": "Maximum size per file, an integer from 1 to 100 MB.",
 		"thinkingWrap": "Mostra pensiero completo",
 		"thinkingWrapDesc": "On: il pensiero è sempre espanso completamente e va a capo (ragionamento in tempo reale visibile durante lo streaming); Off: compresso in un riepilogo di una riga con l'ultimo testo mostrato in tempo reale durante lo streaming",
+		"thinkingPreviewEnabled": "Show thinking preview while collapsed",
+		"thinkingPreviewEnabledDesc": "On: collapsed thinking shows a one-line summary and the latest live reasoning text; Off: only the Think header and expand arrow remain visible until you open the block",
 		"toolsWrap": "Mostra strumenti completi",
 		"toolsWrapDesc": "On: le chiamate strumento sono sempre espanse completamente mostrando argomenti e output; Off: compresse per impostazione predefinita, clicca per espandere",
 		"toolImages": "Mostra immagini degli strumenti",
