@@ -12,6 +12,11 @@ Signal `@mentions` are resolved against known contacts and rendered as readable
 - linked signal-cli account with `signal-cli daemon --http 127.0.0.1:8080`
 - the daemon account configured in the Signal plugin panel
 
+By default the plugin owns the daemon lifecycle: enabling the gateway starts
+`signal-cli -a <account> daemon --http <loopback-url>`, and disabling the
+gateway or unloading the plugin terminates that child process. Select
+**External / systemd** instead when another supervisor already owns the daemon.
+
 The account setup and systemd daemon used by the existing pi-signal integration
 are documented at <https://github.com/aalzubidy/pi-signal>.
 
@@ -22,6 +27,8 @@ are documented at <https://github.com/aalzubidy/pi-signal>.
 - ACI/service IDs are preferred over phone numbers.
 - Group channels must be explicitly enabled.
 - The daemon URL is loopback-only by default.
+- Managed mode refuses to attach to an already-running daemon, preventing the
+  plugin from killing a process it does not own.
 - Image attachments are limited to six images, 5 MiB each, and 12 MiB total.
 - Each channel can use a separate workspace, preset, model, tool profile, and
   system prompt.

@@ -59,6 +59,15 @@ export default {
 							<label>signal-cli daemon URL
 								<input class="signal-daemon" type="text" placeholder="http://127.0.0.1:8080" style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);" />
 							</label>
+							<label>Daemon lifecycle
+								<select class="signal-daemon-mode" style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);">
+									<option value="managed">Managed by this plugin</option>
+									<option value="external">External / systemd</option>
+								</select>
+							</label>
+							<label>signal-cli executable
+								<input class="signal-cli-path" type="text" placeholder="signal-cli" style="width:100%;box-sizing:border-box;margin-top:4px;padding:7px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);" />
+							</label>
 							<label style="display:flex;align-items:center;gap:8px;">
 								<input class="signal-enabled" type="checkbox" />
 								<span>Enable the Signal gateway</span>
@@ -134,6 +143,8 @@ export default {
 		const q = (selector) => el.querySelector(selector);
 		const account = q(".signal-account");
 		const daemon = q(".signal-daemon");
+		const daemonMode = q(".signal-daemon-mode");
+		const signalCliPath = q(".signal-cli-path");
 		const enabled = q(".signal-enabled");
 		const allowed = q(".signal-allowed");
 		const owners = q(".signal-owners");
@@ -152,6 +163,8 @@ export default {
 			const defaults = config.defaults || {};
 			account.value = config.account || "";
 			daemon.value = config.daemonUrl || "http://127.0.0.1:8080";
+			daemonMode.value = config.daemonMode === "external" ? "external" : "managed";
+			signalCliPath.value = config.signalCliPath || "signal-cli";
 			enabled.checked = config.enabled === true;
 			allowed.value = Array.isArray(config.allowedSenders) ? config.allowedSenders.join("\n") : "";
 			owners.value = Array.isArray(config.ownerSenders) ? config.ownerSenders.join("\n") : "";
@@ -174,6 +187,8 @@ export default {
 				enabled: enabled.checked,
 				account: account.value.trim(),
 				daemonUrl: daemon.value.trim(),
+				daemonMode: daemonMode.value,
+				signalCliPath: signalCliPath.value.trim() || "signal-cli",
 				allowedSenders: allowed.value
 					.split(/[\n,，]+/)
 					.map((value) => value.trim())
@@ -201,6 +216,8 @@ export default {
 			metrics.innerHTML = "";
 			const rows = [
 				["Daemon", status.daemonUrl || daemon.value || "(not set)"],
+				["Lifecycle", status.daemonMode || daemonMode.value],
+				["Owned process", status.daemonManaged ? "yes" : "no"],
 				["Account", status.account || "(not set)"],
 				["Received", String(status.messagesReceived || 0)],
 				["Replied", String(status.messagesReplied || 0)],

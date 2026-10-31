@@ -9,6 +9,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:8080";
 const SSE_RETRY_INITIAL_MS = 2_000;
@@ -353,6 +354,32 @@ export function validateDaemonUrl(value, allowRemote = false) {
 	return { ok: true, url: url.toString().replace(/\/+$/, "") };
 }
 
+/**
+ * Build the signal-cli command used when the plugin owns the daemon process.
+ * Managed mode is intentionally loopback-only because the plugin must be able
+ * to connect to and terminate the exact process it starts.
+ */
+export function managedDaemonCommand(config) {
+	const account = normalizePhone(config?.account);
+	if (!account) return { ok: false, error: "Signal account is required for managed daemon mode" };
+	const daemon = validateDaemonUrl(config?.daemonUrl, false);
+	if (!daemon.ok) return daemon;
+	const url = new URL(daemon.url);
+	if (url.protocol !== "http:") {
+		return { ok: false, error: "Managed signal-cli daemon requires an http:// loopback URL" };
+	}
+	if (url.pathname && url.pathname !== "/") {
+		return { ok: false, error: "Managed signal-cli daemon URL must not contain a path" };
+	}
+	const port = url.port || "8080";
+	return {
+		ok: true,
+		command: String(config?.signalCliPath || "signal-cli").trim() || "signal-cli",
+		args: ["-a", account, "daemon", "--http", `${url.hostname}:${port}`],
+		url: daemon.url,
+	};
+}
+
 /** Minimal JSON-RPC client for signal-cli's loopback daemon. */
 async function daemonRpc(baseUrl, method, params, timeoutMs = 15_000) {
 	let res;
@@ -416,19 +443,22 @@ export function formatSignalError(error) {
 
 /** Signal gateway: one SSE reader feeding many isolated pi conversations. */
 export class SignalGateway {
-	constructor({ host, getConfig, setConfig, getSessionMap, setSessionMap, log } = {}) {
+	constructor({ host, getConfig, setConfig, getSessionMap, setSessionMap, log, spawnProcess } = {}) {
 		this.host = host;
 		this.getConfig = getConfig || (() => ({}));
 		this.setConfig = setConfig || (async () => {});
 		this.getSessionMap = getSessionMap || (() => ({}));
 		this.setSessionMap = setSessionMap || (async () => {});
 		this.log = log || ((level, message) => console.log(`[signal:${level}] ${message}`));
+		this.spawnProcess = spawnProcess || spawn;
 
 		this.running = false;
 		this.connected = false;
 		this.accountUuid = "";
 		this.daemonUrl = DEFAULT_DAEMON_URL;
 		this.sseRequest = null;
+		this.daemonChild = null;
+		this.stoppingDaemon = false;
 		this.reconnectTimer = null;
 		this.reconnectDelay = SSE_RETRY_INITIAL_MS;
 		this.offRunEvent = null;
@@ -461,6 +491,8 @@ export class SignalGateway {
 		return {
 			...this.status,
 			daemonUrl: this.daemonUrl,
+			daemonMode: config.daemonMode || "managed",
+			daemonManaged: Boolean(this.daemonChild),
 			channelQueues: Object.fromEntries([...this.channelQueues].map(([key, queue]) => [key, queue.length])),
 			activeChannels: [...this.activeChannels],
 			channelSessions: { ...this.sessionMap },
@@ -483,6 +515,19 @@ export class SignalGateway {
 		this.status.state = "connecting";
 		this.status.account = account;
 		this.status.lastError = null;
+		if ((config.daemonMode || "managed") === "managed") {
+			try {
+				await this.startManagedDaemon();
+			} catch (error) {
+				this.running = false;
+				this.status.enabled = false;
+				this.status.state = "error";
+				this.status.connected = false;
+				this.status.lastError = formatSignalError(error);
+				await this.stopManagedDaemon().catch(() => {});
+				throw error;
+			}
+		}
 		this.accountUuid = await this.resolveAccountUuid(account).catch(() => "");
 		this.status.accountUuid = this.accountUuid;
 
@@ -517,6 +562,7 @@ export class SignalGateway {
 			if (pending.timeout) clearTimeout(pending.timeout);
 		}
 		this.pendingRuns.clear();
+		await this.stopManagedDaemon();
 	}
 
 	async resolveAccountUuid(account) {
@@ -524,6 +570,90 @@ export class SignalGateway {
 		if (!Array.isArray(contacts)) return "";
 		const match = contacts.find((entry) => normalizePhone(entry?.number) === account);
 		return String(match?.uuid || match?.aci || "").trim();
+	}
+
+	/** Check signal-cli's health endpoint with a short timeout. */
+	async daemonReachable() {
+		try {
+			const response = await fetch(`${this.daemonUrl}/api/v1/check`, {
+				signal: AbortSignal.timeout(1_500),
+			});
+			return response.ok;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Spawn the signal-cli daemon and wait until it can serve requests. */
+	async startManagedDaemon() {
+		const command = managedDaemonCommand(this.getConfig() || {});
+		if (!command.ok) throw new Error(command.error);
+		if (await this.daemonReachable()) {
+			throw new Error(
+				`A signal-cli daemon is already running at ${command.url}. Stop the external service, or set daemon mode to External.`,
+			);
+		}
+
+		this.stoppingDaemon = false;
+		const child = this.spawnProcess(command.command, command.args, {
+			stdio: "ignore",
+			env: { ...process.env },
+			shell: false,
+			windowsHide: true,
+		});
+		this.daemonChild = child;
+		let launchError = null;
+		child.once("error", (error) => {
+			launchError = error;
+		});
+
+		const deadline = Date.now() + 60_000;
+		while (Date.now() < deadline) {
+			if (launchError) throw new Error(`Could not start signal-cli: ${formatSignalError(launchError)}`);
+			if (child.exitCode !== null || child.signalCode !== null) {
+				throw new Error(
+					`signal-cli exited during startup (code ${child.exitCode ?? "none"}, signal ${child.signalCode ?? "none"})`,
+				);
+			}
+			if (await this.daemonReachable()) {
+				child.once("exit", (code, signal) => {
+					if (this.daemonChild === child) this.daemonChild = null;
+					if (this.stoppingDaemon || !this.running) return;
+					this.connected = false;
+					this.status.connected = false;
+					this.status.state = "error";
+					this.status.lastError = `signal-cli daemon exited (code ${code ?? "none"}, signal ${signal ?? "none"})`;
+					this.log("warn", this.status.lastError);
+				});
+				return;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+		try {
+			child.kill("SIGTERM");
+		} catch {}
+		if (this.daemonChild === child) this.daemonChild = null;
+		throw new Error("signal-cli daemon did not become ready within 60 seconds");
+	}
+
+	/** Terminate only the child process owned by this gateway. */
+	async stopManagedDaemon() {
+		const child = this.daemonChild;
+		if (!child) return;
+		this.stoppingDaemon = true;
+		const exited = new Promise((resolve) => child.once("exit", resolve));
+		try {
+			child.kill("SIGTERM");
+		} catch {}
+		await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+		if (child.exitCode === null && child.signalCode === null) {
+			try {
+				child.kill("SIGKILL");
+			} catch {}
+			await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+		}
+		if (this.daemonChild === child) this.daemonChild = null;
+		this.stoppingDaemon = false;
 	}
 
 	/** Load and cache contact labels used to render Signal @mentions. */
@@ -1096,6 +1226,8 @@ export function normalizeConfig(value) {
 		enabled: raw.enabled === true,
 		account: normalizePhone(raw.account),
 		daemonUrl: String(raw.daemonUrl || DEFAULT_DAEMON_URL).trim(),
+		daemonMode: raw.daemonMode === "external" ? "external" : "managed",
+		signalCliPath: String(raw.signalCliPath || "signal-cli").trim() || "signal-cli",
 		allowRemoteDaemon: false,
 		allowedSenders,
 		ownerSenders,

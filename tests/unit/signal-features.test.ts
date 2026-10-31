@@ -5,12 +5,14 @@
 import { describe, expect, it, vi } from "vitest";
 // @ts-expect-error jsdom does not ship declarations in this workspace
 import { JSDOM } from "jsdom";
+import { EventEmitter } from "node:events";
 import {
 	SignalGateway,
 	chunkSignalText,
 	composeSignalSystemPrompt,
 	formatSignalError,
 	isSenderAllowed,
+	managedDaemonCommand,
 	normalizeConfig,
 	normalizeSenderId,
 	parseSignalEnvelope,
@@ -494,6 +496,88 @@ describe("Signal delivery helpers", () => {
 			],
 		});
 		expect(String(chatRequest?.text)).toContain("1 image attachment");
+	});
+});
+
+describe("managed signal-cli lifecycle", () => {
+	it("builds a loopback daemon command from the plugin config", () => {
+		expect(
+			managedDaemonCommand({
+				account: "+14165551234",
+				daemonUrl: "http://127.0.0.1:8091",
+				signalCliPath: "/usr/local/bin/signal-cli",
+			}),
+		).toEqual({
+			ok: true,
+			command: "/usr/local/bin/signal-cli",
+			args: ["-a", "+14165551234", "daemon", "--http", "127.0.0.1:8091"],
+			url: "http://127.0.0.1:8091",
+		});
+	});
+
+	it("starts on enable and stops the owned signal-cli process on disable", async () => {
+		class FakeChild extends EventEmitter {
+			exitCode: number | null = null;
+			signalCode: NodeJS.Signals | null = null;
+			killedWith: string = "";
+			kill(signal: NodeJS.Signals) {
+				this.killedWith = signal;
+				this.signalCode = signal;
+				queueMicrotask(() => this.emit("exit", null, signal));
+				return true;
+			}
+		}
+		const child = new FakeChild();
+		let spawned: { command: string; args: string[] } | undefined;
+		let checks = 0;
+		const config = normalizeConfig({
+			enabled: true,
+			account,
+			daemonUrl: "http://127.0.0.1:8092",
+			daemonMode: "managed",
+		});
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url.endsWith("/api/v1/check")) {
+				checks++;
+				if (checks === 1) throw new TypeError("connection refused");
+				return new Response("{}", { status: 200 });
+			}
+			if (url.endsWith("/api/v1/rpc")) {
+				return new Response(JSON.stringify({ result: [{ number: account, uuid: accountUuid }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			throw new Error(`unexpected fetch ${url}`);
+		});
+		const gateway = new SignalGateway({
+			host: {},
+			getConfig: () => config,
+			spawnProcess: (command: string, args: string[]) => {
+				spawned = { command, args: [...args] };
+				return child;
+			},
+		});
+		gateway.connectSse = () => {};
+		await gateway.start();
+		expect(spawned).toEqual({
+			command: "signal-cli",
+			args: ["-a", account, "daemon", "--http", "127.0.0.1:8092"],
+		});
+		expect(gateway.getStatus()).toMatchObject({
+			enabled: true,
+			daemonManaged: true,
+			daemonMode: "managed",
+		});
+		await gateway.stop();
+		expect(child.killedWith).toBe("SIGTERM");
+		expect(gateway.getStatus()).toMatchObject({
+			enabled: false,
+			daemonManaged: false,
+			state: "idle",
+		});
+		fetchSpy.mockRestore();
 	});
 });
 
