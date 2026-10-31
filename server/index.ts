@@ -2666,6 +2666,12 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 	type PluginSearchClient = {
 		searchForPlugins?: (q: string, n?: number) => Promise<{ id: string; title: string }[]>;
 	};
+	type PluginEnsureClient = {
+		ensureConversationForPlugins?: (
+			pluginId: string,
+			spec: import("./plugins.js").PluginConversationEnsureRequest,
+		) => Promise<import("./plugins.js").PluginConversationEnsureResult>;
+	};
 	type PluginWriteClient = {
 		writeForPlugins?: (cid: string, t: string) => Promise<{ ok: boolean; error?: string }>;
 	};
@@ -2707,6 +2713,22 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 			return await cs.searchForPlugins(query, limit ?? 20);
 		} catch {
 			return [];
+		}
+	};
+	// conversationEnsurer：创建/复用不带焦点的后台对话。Signal 等外部通道用稳定
+	// channel key 绑定普通 pi-web-ui 对话，并可按通道配置系统提示词。
+	(pm as any).conversationEnsurer = async (
+		pluginId: string,
+		spec: import("./plugins.js").PluginConversationEnsureRequest,
+	) => {
+		try {
+			const cs = pickClient() as PluginEnsureClient | undefined;
+			if (!cs || typeof cs.ensureConversationForPlugins !== "function") {
+				return { ok: false, error: "当前引擎不支持创建插件对话（仅标准 pi 引擎）" };
+			}
+			return await cs.ensureConversationForPlugins(pluginId, spec);
+		} catch (err) {
+			return { ok: false, error: (err as Error).message };
 		}
 	};
 	// conversationWriter：向指定对话投递 prompt（复用 prompt 路径）；找不到对话回 {ok:false,error}。

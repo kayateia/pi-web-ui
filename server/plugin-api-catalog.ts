@@ -329,8 +329,8 @@ export const HOST_METHODS: ReadonlyArray<CatalogHostMethod> = [
 	},
 	{
 		name: "conversations",
-		needs: "-",
-		summary: "会话目录（list/get/search，只读组装+定向投递）",
+		needs: "chat",
+		summary: "会话目录与后台对话创建（list/get/search/ensure）",
 		example: `await host.conversations.list()`,
 	},
 	{

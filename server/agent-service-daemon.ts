@@ -1049,7 +1049,7 @@ export class AgentService {
 		const clientId = `plugin:${safe}:${acct}`;
 		const text = String(req?.text ?? "");
 		const attachments = normalizePluginChatAttachments(req?.attachments);
-		if (!text.trim()) throw new Error("chatFromPlugin: text 为空");
+		if (!text.trim() && !attachments?.length) throw new Error("chatFromPlugin: text and attachments are empty");
 		if (this.quiesced) throw new QuiesceRejectedError("插件无头调用被拒绝，请等服务器恢复后重试");
 		// 本轮运行的稳定标识：随该轮所有 run 事件下发。为何需要：过户会把对话搬到
 		// 别的客户端会话（clientId 变），目标会话已有同名 id 时还会就地改名
@@ -1090,7 +1090,11 @@ export class AgentService {
 					.catch((err) => console.error("[plugin chat] prompt failed", err));
 				return { conversationId: conv.id, clientId: ownerId, sessionId: conv.session.sessionId, runId };
 			}
+			if (req.strictConversationId === true) {
+				throw new Error(`目标对话不可用，拒绝回落到其他会话：${target}`);
+			}
 		}
+		if (req?.strictConversationId === true) throw new Error("strictConversationId 需要有效的 conversationId");
 		// 2. 工作空间：不传回落伪客户端当前目录；传了必须存在且非系统目录。
 		const cwdReq = String(req?.cwd ?? "").trim();
 		let cwdAbs = "";

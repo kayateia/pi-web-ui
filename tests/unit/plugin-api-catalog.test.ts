@@ -114,6 +114,7 @@ describe("静态表与源码同口径", () => {
 			"route",
 			"registerProxy",
 			"chat",
+			"conversations",
 			"llm.complete",
 			"fs",
 			"fs.requestAccess",
