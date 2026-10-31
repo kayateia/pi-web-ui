@@ -179,6 +179,22 @@ describe("Signal authorization and channel profiles", () => {
 		expect(isSenderAllowed(blocked, config, resolveChannelProfile(parsed, config))).toBe(false);
 	});
 
+	it("matches a sender allowlisted only by the channel", () => {
+		const channelOnly = normalizeConfig({
+			allowedSenders: [],
+			ownerSenders: [],
+			channels: {
+				[parsed.key]: {
+					enabled: true,
+					allowSenders: [`aci:${aliceUuid}`],
+				},
+			},
+		});
+		const profile = resolveChannelProfile(parsed, channelOnly);
+		expect(profile?.allowSenders).toEqual([`aci:${aliceUuid}`]);
+		expect(isSenderAllowed(parsed, channelOnly, profile)).toBe(true);
+	});
+
 	it("requires groups to be explicitly enabled but permits known DMs by default", () => {
 		const groupRaw = directEnvelope("group");
 		groupRaw.envelope.dataMessage.groupInfo = { groupId, groupName: "Unknown" };

@@ -231,7 +231,7 @@ export function parseSignalEnvelope(raw, opts) {
 export function effectiveSenderAllowlist(config, channelConfig) {
 	const values = [
 		...(Array.isArray(config?.allowedSenders) ? config.allowedSenders : []),
-		...(Array.isArray(channelConfig?.allowedSenders) ? channelConfig.allowedSenders : []),
+		...(Array.isArray(channelConfig?.allowSenders) ? channelConfig.allowSenders : []),
 	];
 	return new Set(values.map(normalizeSenderId).filter(Boolean));
 }
@@ -1038,8 +1038,8 @@ export function normalizeConfig(value) {
 					{
 						enabled: channel.enabled === true,
 						name: sanitizeSignalName(channel.name),
-						allowSenders: Array.isArray(channel.allowSenders)
-							? channel.allowSenders.map(normalizeSenderId).filter(Boolean).slice(0, 256)
+						allowSenders: Array.isArray(channel.allowSenders ?? channel.allowedSenders)
+							? (channel.allowSenders ?? channel.allowedSenders).map(normalizeSenderId).filter(Boolean).slice(0, 256)
 							: [],
 						systemPrompt: String(channel.systemPrompt || "").slice(0, 32_768),
 						promptMode: "append",

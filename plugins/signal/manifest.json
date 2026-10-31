@@ -2,7 +2,7 @@
 	"apiVersion": 2,
 	"name": "signal",
 	"nameEn": "Signal",
-	"version": "0.1.5",
+	"version": "0.1.6",
 	"description": "Signal 全账号网关：私聊与群组路由、发送者白名单、每频道系统提示词与独立 pi-web-ui 会话",
 	"descriptionEn": "Full Signal account gateway with DM/group routing, sender allowlists, per-channel prompts, and isolated pi-web-ui conversations.",
 	"author": "pi-web-ui",
