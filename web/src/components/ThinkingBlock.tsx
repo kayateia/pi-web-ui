@@ -118,7 +118,9 @@ export function ThinkingBlock({
 	// null = 未手动点过 → 跟随开关：wrap=true（开）→ 完整展开；wrap=false（关）→ 折叠。
 	// 流式与结束后行为一致——不再出现「流式折叠、结束后又自动展开」的跳动。
 	const [open, setOpen] = useState<boolean | null>(null);
-	const expanded = open ?? wrap;
+	// Quiet mode is authoritative: even when "Show full thinking" is enabled,
+	// reasoning remains collapsed until the user explicitly opens this block.
+	const expanded = open ?? (wrap && previewEnabled);
 	// 搜索期间 forceOpen 只是“视口展开”，用户 open 状态不受影响
 	const shown = expanded || forceOpen;
 

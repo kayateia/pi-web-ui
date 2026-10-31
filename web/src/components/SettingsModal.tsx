@@ -4135,9 +4135,9 @@ export function SettingsModal({
 									onToggle={() => setPartial({ thinkingWrap: !(settings.thinkingWrap ?? true) })}
 								/>
 								<ToggleRow
-									title={t("thinkingPreviewEnabled")}
-									tip={t("thinkingPreviewEnabledDesc")}
-									enabled={settings.thinkingPreviewEnabled ?? true}
+									title={t("thinkingQuietMode")}
+									tip={t("thinkingQuietModeDesc")}
+									enabled={!(settings.thinkingPreviewEnabled ?? true)}
 									onToggle={() =>
 										setPartial({
 											thinkingPreviewEnabled: !(settings.thinkingPreviewEnabled ?? true),

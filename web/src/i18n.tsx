@@ -1894,9 +1894,9 @@ export const zh = {
 	thinkingWrap: "完整显示思考",
 	thinkingWrapDesc:
 		"开启：思考内容始终完整展开并自动换行（流式推理过程也实时可见）；关闭：折叠成一行摘要，流式中一行实时显示最新文本",
-	thinkingPreviewEnabled: "折叠时显示思考预览",
-	thinkingPreviewEnabledDesc:
-		"开启：思考折叠时显示一行摘要，流式中显示最新推理文本；关闭：折叠态只保留 Think 卡头与展开箭头，推理正文完全隐藏，点击箭头后才显示",
+	thinkingQuietMode: "展开前隐藏思考内容",
+	thinkingQuietModeDesc:
+		"开启：折叠时只显示思考进行中的状态和展开箭头，不显示摘要或跑马灯；即使同时开启「完整显示思考」，也必须手动展开才会显示推理正文",
 	toolsWrap: "完整显示工具",
 	toolsWrapDesc: "开启：工具调用始终完整展开显示参数和输出；关闭：默认折叠，点击展开",
 	toolImages: "直接显示工具结果图片",
@@ -4633,9 +4633,9 @@ export const en: Record<keyof typeof zh, string> = {
 	thinkingWrap: "Show full thinking",
 	thinkingWrapDesc:
 		"On: thinking always expands fully and wraps (live reasoning visible while streaming); Off: collapses to a one-line summary with the latest text shown live while streaming",
-	thinkingPreviewEnabled: "Show thinking preview while collapsed",
-	thinkingPreviewEnabledDesc:
-		"On: collapsed thinking shows a one-line summary and the latest live reasoning text; Off: only the Think header and expand arrow remain visible until you open the block",
+	thinkingQuietMode: "Hide thinking text until expanded",
+	thinkingQuietModeDesc:
+		"On: collapsed thinking shows only the active indicator and expand arrow, with no summary or marquee; this overrides Show full thinking until you open the block manually",
 	toolsWrap: "Show full tools",
 	toolsWrapDesc:
 		"On: tool calls always expand fully showing arguments and output; Off: collapsed by default, click to expand",
