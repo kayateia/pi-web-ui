@@ -2,10 +2,13 @@
  * Signal gateway policy and routing tests. No network or real Signal account is
  * involved.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+// @ts-expect-error jsdom does not ship declarations in this workspace
+import { JSDOM } from "jsdom";
 import {
 	SignalGateway,
 	chunkSignalText,
+	formatSignalError,
 	isSenderAllowed,
 	normalizeConfig,
 	normalizeSenderId,
@@ -14,6 +17,7 @@ import {
 	signalRecipient,
 } from "../../plugins/signal/index.mjs";
 import activateSignalPlugin from "../../plugins/signal/index.mjs";
+import signalClient from "../../plugins/signal/client/entry.mjs";
 
 const account = "+14165551234";
 const accountUuid = "11111111-1111-4111-8111-111111111111";
@@ -228,7 +232,7 @@ describe("Signal delivery helpers", () => {
 
 describe("Signal plugin activation", () => {
 	it("stays idle without an account and returns config/status to the UI", async () => {
-		let onClientMessage: ((message: unknown, reply: (payload: unknown) => void) => void) | undefined;
+		let onClientMessage: ((message: unknown, reply: (payload: unknown) => void) => void | Promise<void>) | undefined;
 		const host = {
 			cwd: "/workspace",
 			storage: {
@@ -245,14 +249,138 @@ describe("Signal plugin activation", () => {
 		const dispose = await activateSignalPlugin(host);
 		expect(typeof dispose).toBe("function");
 		let replyPayload: Record<string, unknown> | undefined;
-		onClientMessage?.({ type: "get_state" }, (payload) => {
+		await onClientMessage?.({ type: "get_state", reqId: "state-1" }, (payload) => {
 			replyPayload = payload as Record<string, unknown>;
 		});
 		expect(replyPayload).toMatchObject({
 			type: "state",
+			reqId: "state-1",
 			hostCwd: "/workspace",
 			status: { state: "idle", connected: false },
 		});
 		await dispose();
+	});
+
+	it("returns the underlying daemon failure and echoes the UI request id", async () => {
+		let onClientMessage: ((message: unknown, reply: (payload: unknown) => void) => void | Promise<void>) | undefined;
+		const host = {
+			cwd: "/workspace",
+			storage: { get: async () => undefined, set: async () => {} },
+			onClientMessage: (handler: typeof onClientMessage) => {
+				onClientMessage = handler;
+				return () => {};
+			},
+			log: () => {},
+			notify: () => {},
+		};
+		const dispose = await activateSignalPlugin(host);
+		const cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8080"), {
+			code: "ECONNREFUSED",
+		});
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed", { cause }));
+		let replyPayload: Record<string, unknown> | undefined;
+		await onClientMessage?.(
+			{
+				type: "test",
+				reqId: "test-1",
+				config: {
+					account: "+14165551234",
+					daemonUrl: "http://127.0.0.1:8080",
+				},
+			},
+			(payload) => {
+				replyPayload = payload as Record<string, unknown>;
+			},
+		);
+		fetchSpy.mockRestore();
+		expect(replyPayload).toMatchObject({
+			type: "test_done",
+			success: false,
+			reqId: "test-1",
+		});
+		expect(String(replyPayload?.message)).toContain("http://127.0.0.1:8080");
+		expect(String(replyPayload?.message)).toContain("ECONNREFUSED");
+		expect(String(replyPayload?.message).match(/fetch failed/g)).toHaveLength(1);
+		await dispose();
+	});
+
+	it("formats nested fetch causes without dropping the error code", () => {
+		const error = new TypeError("fetch failed", {
+			cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+		});
+		expect(formatSignalError(error)).toContain("fetch failed");
+		expect(formatSignalError(error)).toContain("ECONNREFUSED");
+	});
+});
+
+describe("Signal plugin client RPC", () => {
+	it("waits for the reqId-matched plugin_data reply and shows its detail", async () => {
+		type ClientPayload = {
+			type?: string;
+			reqId?: string;
+			config?: Record<string, unknown>;
+			status?: Record<string, unknown>;
+			success?: boolean;
+			message?: string;
+			[field: string]: unknown;
+		};
+		const dom = new JSDOM("<!doctype html><div id='root'></div>");
+		const previousWindow = globalThis.window;
+		const previousDocument = globalThis.document;
+		const previousAlert = globalThis.alert;
+		const alerts: string[] = [];
+		Object.assign(globalThis, {
+			window: dom.window,
+			document: dom.window.document,
+			alert: (message: unknown) => alerts.push(String(message)),
+		});
+		let dataHandler: ((payload: ClientPayload) => void) | undefined;
+		const ctx = {
+			send: (payload: ClientPayload) => {
+				if (payload.type === "get_state") {
+					queueMicrotask(() =>
+						dataHandler?.({
+							type: "state",
+							reqId: payload.reqId,
+							config: {},
+							status: { state: "idle" },
+						}),
+					);
+				}
+				if (payload.type === "test") {
+					queueMicrotask(() =>
+						dataHandler?.({
+							type: "test_done",
+							reqId: payload.reqId,
+							success: false,
+							message: "Cannot reach signal-cli at http://127.0.0.1:8080: ECONNREFUSED",
+						}),
+					);
+				}
+				return true;
+			},
+			onData: (handler: (payload: ClientPayload) => void) => {
+				dataHandler = handler;
+				return () => {};
+			},
+		};
+		const root = dom.window.document.querySelector("#root");
+		const cleanup = await signalClient.mount(root, ctx);
+		const deadline = Date.now() + 1000;
+		while (!root.querySelector(".signal-test") && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		root.querySelector(".signal-test").dispatchEvent(new dom.window.Event("click"));
+		while (alerts.length === 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		expect(alerts[0]).toContain("Cannot reach signal-cli");
+		expect(alerts[0]).toContain("ECONNREFUSED");
+		cleanup();
+		Object.assign(globalThis, {
+			window: previousWindow,
+			document: previousDocument,
+			alert: previousAlert,
+		});
 	});
 });
