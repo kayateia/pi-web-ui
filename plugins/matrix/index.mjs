@@ -7,7 +7,9 @@
  * access control whitelist, and slash commands.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
+import { scopeKey, threadOf, mediaTypes, receiveMedia, sendMedia } from "./channel-behavior.mjs";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 
 export const SECRET_ACCESS_TOKEN = "matrix.accessToken";
@@ -40,10 +42,54 @@ export function extractMatrixText(content = {}, botUserId = "") {
 	return text;
 }
 
+/** Normalize the Matrix gateway prompt for persistence and request assembly. */
+export function normalizeMatrixSystemPrompt(value) {
+	return String(value ?? "").slice(0, 32_768);
+}
+
+/** Compose the additive Matrix prompt without replacing pi-web-ui's normal prompt. */
+export function composeMatrixSystemPrompt(systemPrompt) {
+	const text = String(systemPrompt ?? "").trim();
+	return text ? `Matrix gateway instructions:\n${text}` : "";
+}
+
+/** Format nested fetch/timeout causes without including credentials. */
+export function formatMatrixError(error) {
+	if (!(error instanceof Error)) return String(error ?? "unknown error");
+	const parts = [error.message || error.name || "unknown error"];
+	let cause = error.cause;
+	for (let depth = 0; cause && depth < 3; depth += 1) {
+		if (cause instanceof Error) {
+			const code =
+				typeof cause.code === "string" && cause.code && !parts.join(" ").includes(cause.code) ? ` (${cause.code})` : "";
+			if (cause.message && !parts.some((part) => part.includes(cause.message))) {
+				parts.push(`${cause.message}${code}`);
+			}
+			cause = cause.cause;
+		} else if (typeof cause === "object" && cause && "code" in cause) {
+			const code = String(cause.code ?? "").trim();
+			if (code && !parts.join(" ").includes(code)) parts.push(code);
+			break;
+		} else {
+			break;
+		}
+	}
+	return parts.join(": ");
+}
+
 /**
  * Matrix Client-Server API request helper.
  */
 export async function matrixApi(homeserverUrl, accessToken, method, path, payload = null, { timeoutMs = 35000 } = {}) {
+	let parsedUrl;
+	try {
+		parsedUrl = new URL(String(homeserverUrl ?? ""));
+	} catch {
+		throw new Error(`Invalid Matrix homeserver URL: ${homeserverUrl || "(empty)"}`);
+	}
+	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+		throw new Error("Matrix homeserver URL must use http:// or https://");
+	}
 	const base = homeserverUrl.replace(/\/+$/, "");
 	const subpath = path.startsWith("/") ? path : `/${path}`;
 	const url = `${base}${subpath}`;
@@ -58,19 +104,45 @@ export async function matrixApi(homeserverUrl, accessToken, method, path, payloa
 		headers["Content-Type"] = "application/json; charset=utf-8";
 	}
 
-	const res = await fetch(url, {
-		method,
-		headers,
-		body: payload !== null ? JSON.stringify(payload) : undefined,
-		signal: AbortSignal.timeout(timeoutMs),
-	});
-
-	if (!res.ok) {
-		const errJson = await res.json().catch(() => ({}));
-		throw new Error(errJson.error || `Matrix HTTP ${res.status}`);
+	let res;
+	try {
+		const request = {
+			method,
+			headers,
+			signal: AbortSignal.timeout(timeoutMs),
+		};
+		if (payload !== null) request.body = JSON.stringify(payload);
+		res = await fetch(url, request);
+	} catch (error) {
+		throw new Error(`Cannot reach Matrix homeserver ${base} for ${method} ${subpath}: ${formatMatrixError(error)}`, {
+			cause: error,
+		});
 	}
 
-	return await res.json().catch(() => ({}));
+	let json = {};
+	let text = "";
+	if (typeof res.text === "function") {
+		text = await res.text().catch(() => "");
+		if (text.trim()) {
+			try {
+				json = JSON.parse(text);
+			} catch {
+				json = {};
+			}
+		}
+	} else if (typeof res.json === "function") {
+		// Older/mock Response-shaped objects may expose json() only.
+		json = await res.json().catch(() => ({}));
+	}
+	if (!res.ok) {
+		const errcode = typeof json?.errcode === "string" && json.errcode ? ` [${json.errcode}]` : "";
+		const detail =
+			(typeof json?.error === "string" && json.error.trim()) ||
+			(text.trim() && !text.trim().startsWith("<") ? text.trim().slice(0, 500) : "");
+		throw new Error(`Matrix ${method} ${subpath} failed: HTTP ${res.status}${errcode}${detail ? ` - ${detail}` : ""}`);
+	}
+
+	return json;
 }
 
 /**
@@ -81,11 +153,15 @@ export class MatrixBotBridge {
 	 * @param {object} options
 	 * @param {any} options.host
 	 * @param {() => any} options.getConfig
+	 * @param {() => Record<string, unknown>} [options.getSessionMap]
+	 * @param {(value: Record<string, unknown>) => Promise<void>} [options.setSessionMap]
 	 * @param {(level: string, msg: string) => void} [options.log]
 	 */
-	constructor({ host, getConfig, log } = {}) {
+	constructor({ host, getConfig, getSessionMap = () => ({}), setSessionMap = async () => {}, log } = {}) {
 		this.host = host;
 		this.getConfig = getConfig;
+		this.getSessionMap = getSessionMap;
+		this.setSessionMap = setSessionMap;
 		this.log = log || ((level, msg) => console.log(`[matrix-bot:${level}] ${msg}`));
 
 		this.running = false;
@@ -103,6 +179,16 @@ export class MatrixBotBridge {
 		this.earlyRuns = new Map();
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map();
+		this.preferences = new Map();
+		this.epochs = new Map();
+		this.sessionRoutes = new Map();
+		this.routingLoaded = null;
+		this.routingWrites = Promise.resolve();
+		this.routingGeneration = 0;
+		this.completedRuns = new Set();
+		this.downloads = new Map();
+		this.dispatching = 0;
+		this.encryptedRooms = new Set();
 
 		this.status = {
 			enabled: false,
@@ -125,7 +211,91 @@ export class MatrixBotBridge {
 		return String(this.userWorkspaces.get(sender) || cfg?.workspace || this.host?.cwd || "").trim();
 	}
 
+	accountIdentity() {
+		const cfg = this.getConfig();
+		return createHash("sha256")
+			.update(JSON.stringify([cfg.homeserverUrl || "", cfg.accessToken || ""]))
+			.digest("hex");
+	}
+
+	sessionKey(identity) {
+		if (identity.sessionId) return `session:${identity.sessionId}`;
+		return identity.clientId && identity.conversationId
+			? `owner:${JSON.stringify([identity.clientId, identity.conversationId])}`
+			: "";
+	}
+
+	async loadRouting() {
+		if (!this.routingLoaded)
+			this.routingLoaded = (async () => {
+				this.routingAccount = this.accountIdentity();
+				const saved = await this.host.storage?.get?.("sessionRoutes");
+				if (saved?.account !== this.routingAccount) {
+					await this.saveRouting();
+					return;
+				}
+				this.epochs = new Map(saved.epochs || []);
+				this.sessionRoutes = new Map((saved.routes || []).filter(([key]) => key.startsWith("session:")));
+			})();
+		await this.routingLoaded;
+		if (this.routingAccount !== this.accountIdentity()) await this.invalidateRouting();
+	}
+
+	async saveRouting() {
+		while (this.sessionRoutes.size > 200) this.sessionRoutes.delete(this.sessionRoutes.keys().next().value);
+		const value = {
+			account: this.routingAccount,
+			epochs: [...this.epochs],
+			routes: [...this.sessionRoutes].filter(([key]) => key.startsWith("session:")),
+		};
+		const write = this.routingWrites.then(() => this.host.storage?.set?.("sessionRoutes", value));
+		this.routingWrites = write.catch(() => {});
+		await write;
+	}
+
+	async invalidateRouting() {
+		this.routingGeneration++;
+		this.routingAccount = this.accountIdentity();
+		this.sessionRoutes.clear();
+		this.pendingRuns.clear();
+		this.earlyRuns.clear();
+		this.userConversations.clear();
+		this.epochs.clear();
+		await this.setSessionMap({});
+		await this.saveRouting();
+	}
+
+	validRoute(route) {
+		return (
+			route &&
+			!route.ambiguous &&
+			route.account === this.routingAccount &&
+			route.epoch === (this.epochs.get(route.key) || 0)
+		);
+	}
+
+	async bindRoute(identity, run) {
+		const key = this.sessionKey(identity);
+		if (!key) return;
+		const previous = this.sessionRoutes.get(key);
+		this.sessionRoutes.set(
+			key,
+			previous?.ambiguous || (this.validRoute(previous) && previous.key !== run.key)
+				? { ambiguous: true }
+				: {
+						key: run.key,
+						roomId: run.roomId,
+						threadId: run.threadId,
+						sender: run.sender,
+						epoch: run.epoch,
+						account: this.routingAccount,
+					},
+		);
+		await this.saveRouting();
+	}
+
 	async start() {
+		await this.loadRouting();
 		if (this.running) return;
 		this.running = true;
 		this.status.enabled = true;
@@ -169,6 +339,9 @@ export class MatrixBotBridge {
 	}
 
 	async stop() {
+		this.routingGeneration++;
+		this.pendingRuns.clear();
+		this.earlyRuns.clear();
 		this.running = false;
 		this.status.enabled = false;
 		this.status.connected = false;
@@ -181,6 +354,8 @@ export class MatrixBotBridge {
 			this.syncAbort = null;
 		}
 
+		for (const controller of this.downloads.values()) controller.abort(new Error("Matrix bot stopped"));
+		this.downloads.clear();
 		if (this.offRunEvent) {
 			try {
 				this.offRunEvent();
@@ -227,10 +402,14 @@ export class MatrixBotBridge {
 				if (!initialSync) {
 					const joinedRooms = res?.rooms?.join || {};
 					for (const [roomId, roomData] of Object.entries(joinedRooms)) {
+						for (const state of roomData?.state?.events || []) {
+							if (state.type === "m.room.encryption") this.encryptedRooms.add(roomId);
+						}
 						const events = roomData?.timeline?.events || [];
 						for (const ev of events) {
-							if (ev.type === "m.room.message") {
-								await this.onInboundMessage(roomId, ev).catch((err) => {
+							if (ev.type === "m.room.encryption") this.encryptedRooms.add(roomId);
+							if (ev.type === "m.room.message" || ev.type === "m.room.encrypted") {
+								void this.onInboundMessage(roomId, ev).catch((err) => {
 									this.log("warn", `Matrix event handling error: ${err.message}`);
 								});
 							}
@@ -249,218 +428,424 @@ export class MatrixBotBridge {
 		}
 	}
 
-	async onInboundMessage(roomId, event) {
-		if (!event || event.sender === this.botUserId) return;
-		// m.notice 是 Matrix 生态的机器人消息约定——不滤掉会与其他 bot 互聊死循环
-		if (event.content?.msgtype === "m.notice") return;
-		const eventId = event.event_id;
-		if (eventId) {
-			if (this.seenEventIds.has(eventId)) return;
-			this.seenEventIds.add(eventId);
-			if (this.seenEventIds.size > 500) {
-				const first = this.seenEventIds.values().next().value;
-				this.seenEventIds.delete(first);
-			}
-		}
-
-		const sender = event.sender;
-		const cleanText = extractMatrixText(event.content, this.botUserId);
-		if (!cleanText) return;
-
-		const cfg = this.getConfig();
-
-		// Whitelist check
-		const allowedUsers = Array.isArray(cfg.allowedUsers)
-			? cfg.allowedUsers.map((u) => String(u).trim()).filter(Boolean)
-			: [];
-		if (allowedUsers.length > 0 && sender && !allowedUsers.includes(sender)) {
-			this.log("info", `Matrix user ${sender} blocked by whitelist`);
-			return;
-		}
-
-		this.status.messagesReceived++;
-		this.status.lastMessageAt = Date.now();
-
-		// Slash command handling (/help, /clear, /new, /status)
-		if (cleanText.startsWith("/")) {
-			const handled = await this.handleSlashCommand(cleanText, { roomId, sender, cfg });
-			if (handled) return;
-		}
-
-		// Prepare isolated agent session for this user
-		const accountId = peerAccountId(sender);
-		let conversationId = this.userConversations.get(sender);
-		if (!conversationId) {
-			conversationId = `mtx_${sender.replace(/[^a-zA-Z0-9]/g, "_").slice(-12)}_${Date.now().toString(36)}`;
-			this.userConversations.set(sender, conversationId);
-		}
-
-		this.pendingRuns.set(conversationId, {
-			roomId,
-			sender,
-			accumulatedText: "",
-			startedAt: Date.now(),
-		});
-
+	async feedback(roomId, text, threadId = "", isCurrent = () => true) {
 		try {
-			const workspace = this.resolveWorkspace(sender, cfg);
-			const chatReq = {
-				text: cleanText,
-				accountId,
-				conversationId,
-			};
-			if (workspace) chatReq.cwd = workspace;
-			if (cfg.model) chatReq.model = cfg.model;
-			if (cfg.thinkingLevel) chatReq.thinkingLevel = cfg.thinkingLevel;
-			await this.host.chat(chatReq);
+			if (!isCurrent()) return;
+			await this.sendRoomMessage(roomId, text, threadId, isCurrent);
 		} catch (err) {
-			this.log("warn", `Matrix host.chat dispatch failed: ${err.message}`);
-			this.pendingRuns.delete(conversationId);
-			await this.sendRoomMessage(roomId, `任务启动失败：${err.message}`).catch(() => {});
+			this.status.lastError = err.message;
+			this.log("warn", `Matrix feedback delivery failed: ${err.message}`);
 		}
 	}
 
-	async sendRoomMessage(roomId, text) {
+	conversationStorageKey(key, epoch) {
+		return `matrix:${this.routingAccount}:${peerAccountId(key, "scope")}:g${epoch}`;
+	}
+
+	/**
+	 * Create or reopen the background conversation for a Matrix room scope.
+	 *
+	 * Matrix prompts use append mode so the normal pi-web-ui preamble, tool
+	 * guidance, and project context remain intact.
+	 */
+	async ensureConversation(key, roomId, sender, cfg, epoch, workspace) {
+		const systemPrompt = composeMatrixSystemPrompt(cfg.systemPrompt);
+		const ensure = this.host.conversations?.ensure;
+		if (typeof ensure !== "function") {
+			if (systemPrompt) {
+				throw new Error("Matrix system prompts require a pi-web-ui host with conversation profiles.");
+			}
+			const conversationId = this.userConversations.get(key) || `mtx_${randomUUID()}`;
+			this.userConversations.set(key, conversationId);
+			return { conversationId, managed: false };
+		}
+
+		const storageKey = this.conversationStorageKey(key, epoch);
+		const currentSessionMap = this.getSessionMap?.();
+		const sessionMap =
+			currentSessionMap && typeof currentSessionMap === "object" && !Array.isArray(currentSessionMap)
+				? currentSessionMap
+				: {};
+		const saved = sessionMap[storageKey] && typeof sessionMap[storageKey] === "object" ? sessionMap[storageKey] : {};
+		const model = this.preferences.get(key)?.model ?? cfg.model;
+		const thinkingLevel = this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel;
+		const result = await ensure.call(this.host.conversations, {
+			key: storageKey,
+			title: `Matrix · ${sender || roomId}`,
+			...(workspace ? { cwd: workspace } : {}),
+			systemPrompt,
+			systemPromptMode: "append",
+			...(saved.sessionFile ? { sessionFile: saved.sessionFile } : {}),
+			...(model ? { model } : {}),
+			...(thinkingLevel ? { thinkingLevel } : {}),
+		});
+		if (!result?.ok || !result.conversationId) {
+			throw new Error(result?.error || "Could not create or reopen the Matrix conversation.");
+		}
+
+		this.userConversations.set(key, result.conversationId);
+		const next = {
+			...sessionMap,
+			[storageKey]: {
+				conversationId: result.conversationId,
+				...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+				updatedAt: Date.now(),
+			},
+		};
+		while (Object.keys(next).length > 200) delete next[Object.keys(next)[0]];
+		await this.setSessionMap(next).catch((error) => {
+			this.log("warn", `Matrix conversation map persistence failed: ${error.message}`);
+		});
+		return { conversationId: result.conversationId, managed: true };
+	}
+
+	async onInboundMessage(roomId, event) {
+		await this.loadRouting();
+		if (!event || event.sender === this.botUserId || event.content?.msgtype === "m.notice") return;
 		const cfg = this.getConfig();
-		if (!cfg.homeserverUrl || !cfg.accessToken) return;
-		const txnId = `pi_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+		const sender = event.sender;
+		const allowed = (cfg.allowedUsers || []).map((v) => String(v).trim()).filter(Boolean);
+		if (allowed.length && !allowed.includes(sender)) return;
+		if (event.event_id && this.seenEventIds.has(event.event_id)) return;
+		if (event.event_id) this.seenEventIds.add(event.event_id);
+		if (this.seenEventIds.size > 500) this.seenEventIds.delete(this.seenEventIds.values().next().value);
+		const threadId = threadOf(event.content);
+		const key = scopeKey(roomId, sender, threadId);
+		let downloadSignal;
+		try {
+			if (event.type === "m.room.encrypted" || this.encryptedRooms.has(roomId))
+				throw new Error("E2EE rooms cannot be decrypted or encrypted by this plugin. Use an unencrypted room.");
+			let text = extractMatrixText(event.content, this.botUserId);
+			const content = event.content || {};
+			if (/^[/／]/.test(text) && !mediaTypes[content.msgtype]) {
+				const command = await this.handleSlashCommand(text, { roomId, sender, cfg, key, threadId });
+				if (!command?.prompt) return;
+				if (command.epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，请重试重置提示词");
+				text = command.prompt;
+			}
+			const workspace = this.resolveWorkspace(key, cfg);
+			const epoch = this.epochs.get(key) || 0;
+			const attachments = [];
+			if (mediaTypes[content.msgtype]) {
+				if (this.downloads.has(key)) throw new Error("当前附件正在下载，请等待或 /stop。");
+				const controller = new AbortController();
+				downloadSignal = controller.signal;
+				this.downloads.set(key, controller);
+				let downloaded;
+				try {
+					downloaded = await receiveMedia(this, content, workspace, controller.signal);
+					controller.signal.throwIfAborted();
+				} catch (err) {
+					if (this.downloads.get(key) === controller) this.downloads.delete(key);
+					throw err;
+				}
+				const { path, bytes } = downloaded;
+				const name = content.filename || content.body || "attachment";
+				if (content.msgtype === "m.image") {
+					const mimeType = content.info?.mimetype;
+					if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType))
+						throw new Error("Unsupported image MIME type");
+					attachments.push({ path: "", imageData: bytes.toString("base64"), mimeType, name });
+				} else attachments.push({ path, mode: "reference", name });
+				text = `${text}\nReceived ${mediaTypes[content.msgtype]} saved at ${JSON.stringify(path)}. Use read on this local path where supported. Images are also attached as imageData for vision-capable models. Audio/video are not transcribed or decoded by the channel; explicitly report unavailable decoding tools.`;
+				await this.sendRoomMessage(
+					roomId,
+					`📎 已保存附件：${path}\n图片随附件传入支持视觉的模型；渠道不转录语音或解码视频。`,
+					threadId,
+				);
+			} else if (content.msgtype && !["m.text", "m.emote"].includes(content.msgtype))
+				throw new Error(`Unsupported Matrix message type: ${content.msgtype}`);
+			if (!text) return;
+			if (downloadSignal && this.downloads.get(key)?.signal === downloadSignal) this.downloads.delete(key);
+			downloadSignal?.throwIfAborted();
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，取消旧消息派发");
+			this.status.messagesReceived++;
+			this.status.lastMessageAt = Date.now();
+			if ([...this.pendingRuns.values()].some((run) => run.key === key))
+				throw new Error("当前会话仍在运行，请先 /stop 或等待完成。");
+			const conversation = await this.ensureConversation(key, roomId, sender, cfg, epoch, workspace);
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，取消旧消息派发");
+			const conversationId = conversation.conversationId;
+			const run = {
+				key,
+				epoch,
+				generation: this.routingGeneration,
+				account: this.routingAccount,
+				roomId,
+				threadId,
+				sender,
+				conversationId,
+				requestedId: conversationId,
+				accumulatedText: "",
+			};
+			this.pendingRuns.set(conversationId, run);
+			this.dispatching++;
+			try {
+				const result = await this.host.chat({
+					text,
+					...(attachments.length ? { attachments } : {}),
+					accountId: peerAccountId(`${key}:${this.epochs.get(key) || 0}`),
+					conversationId,
+					...(conversation.managed ? { strictConversationId: true } : {}),
+					...(workspace ? { cwd: workspace } : {}),
+					...Object.fromEntries(
+						Object.entries({
+							model: this.preferences.get(key)?.model ?? cfg.model,
+							thinkingLevel: this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel,
+						}).filter(([, v]) => v),
+					),
+				});
+				if (
+					run.account !== this.accountIdentity() ||
+					run.generation !== this.routingGeneration ||
+					epoch !== (this.epochs.get(key) || 0)
+				)
+					return;
+				if (this.pendingRuns.get(conversationId) === run) this.pendingRuns.delete(conversationId);
+				run.conversationId = result?.conversationId || conversationId;
+				run.runId = result?.runId;
+				run.sessionId = result?.sessionId;
+				run.clientId = result?.clientId;
+				await this.bindRoute(run, run);
+				if (
+					run.account !== this.accountIdentity() ||
+					run.generation !== this.routingGeneration ||
+					epoch !== (this.epochs.get(key) || 0)
+				)
+					return;
+				this.userConversations.set(key, run.conversationId);
+				if (run.ended) return;
+				const pendingKey = run.runId ? `run:${run.runId}` : this.sessionKey(run);
+				if (!pendingKey) return;
+				this.pendingRuns.set(pendingKey, run);
+				const earlyKey = pendingKey;
+				const early = this.earlyRuns.get(earlyKey);
+				this.earlyRuns.delete(earlyKey);
+				if (early?.message) await this.handleRunEvent(early.message);
+				if (early?.end) await this.handleRunEvent(early.end);
+			} catch (err) {
+				for (const [id, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(id);
+				throw err;
+			} finally {
+				this.dispatching--;
+				if (!this.dispatching) this.earlyRuns.clear();
+			}
+		} catch (err) {
+			if (downloadSignal && this.downloads.get(key)?.signal === downloadSignal) this.downloads.delete(key);
+			await this.feedback(roomId, `❌ ${err.message}`, threadId);
+		}
+	}
+
+	async sendContent(roomId, content, threadId = "", isCurrent = () => true) {
+		if (!isCurrent()) return;
+		const cfg = this.getConfig();
+		if (!cfg.homeserverUrl || !cfg.accessToken) throw new Error("Matrix credentials are not configured");
+		if (this.encryptedRooms.has(roomId)) throw new Error("E2EE sending is unsupported; use an unencrypted room");
+		// Check room state for outbound-only rooms as well; never leak plaintext into an E2EE room.
+		const state = await matrixApi(
+			cfg.homeserverUrl,
+			cfg.accessToken,
+			"GET",
+			`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`,
+		);
+		if (!isCurrent()) return;
+		if (Array.isArray(state) && state.some((ev) => ev.type === "m.room.encryption")) {
+			this.encryptedRooms.add(roomId);
+			throw new Error("E2EE sending is unsupported; use an unencrypted room");
+		}
+		if (threadId) content = { ...content, "m.relates_to": { rel_type: "m.thread", event_id: threadId } };
 		await matrixApi(
 			cfg.homeserverUrl,
 			cfg.accessToken,
 			"PUT",
-			`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`,
-			{
-				msgtype: "m.text",
-				body: text,
-			},
+			`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/pi_${randomUUID()}`,
+			content,
 		);
 	}
 
-	async handleSlashCommand(cmdText, { roomId, sender, cfg }) {
-		const parts = cmdText.trim().split(/\s+/);
-		const cmd = parts[0].toLowerCase();
+	async sendRoomMessage(roomId, text, threadId = "", isCurrent = () => true) {
+		await this.sendContent(roomId, { msgtype: "m.text", body: text }, threadId, isCurrent);
+	}
 
+	async resetScope(key) {
+		this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
+		for (const [id, route] of this.sessionRoutes) if (route.key === key) this.sessionRoutes.delete(id);
+		await this.saveRouting();
+	}
+
+	async handleSlashCommand(cmdText, { roomId, sender, cfg, key = scopeKey(roomId, sender), threadId = "" }) {
+		cmdText = cmdText.trim().replace(/^／/, "/");
+		const [command] = cmdText.split(/\s+/);
+		const cmd = command.toLowerCase();
+		let arg = cmdText.slice(command.length).trim();
+		if (cmd === "/thinking" || (cmd === "/model" && arg.toLowerCase() === "default")) arg = arg.toLowerCase();
+		const epoch = this.epochs.get(key) || 0;
+		const ensureIdle = () => {
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，请重试命令");
+			if ([...this.pendingRuns.values()].some((r) => r.key === key))
+				throw new Error("请先 /stop 并等待任务结束，再切换会话设置。");
+		};
+		const reply = (text) => this.sendRoomMessage(roomId, text, threadId);
+		const prefs = this.preferences.get(key) || {};
 		switch (cmd) {
-			case "/help": {
-				const helpText = [
-					"🔮 **pi-web-ui Matrix 机器人帮助**",
-					"",
-					"- 发送消息即可与 AI 助手对话，支持多轮上下文",
-					"- `/cwd [路径]` 或 `/workspace [路径]`：查看或切换当前项目根目录",
-					"- `/model`：查看当前配置的 AI 模型与思考强度",
-					"- `/clear` 或 `/new`：清空当前上下文，开启全新会话",
-					"- `/status`：查看机器人运行状态与指标",
-					"- `/help`：展示本帮助信息",
-				].join("\n");
-				await this.sendRoomMessage(roomId, helpText).catch(() => {});
-				return true;
-			}
-			case "/model": {
-				const currentModel = cfg.model || "(默认跟随全局)";
-				const currentThinking = cfg.thinkingLevel || "(跟随全局)";
-				await this.sendRoomMessage(
-					roomId,
-					`🔮 **当前模型与思考配置**\n- 模型 (Model)：\`${currentModel}\`\n- 思考强度 (Thinking)：\`${currentThinking}\``,
-				).catch(() => {});
-				return true;
-			}
-			case "/cwd":
-			case "/workspace": {
-				const argPath = cmdText.replace(/^\/\S+/, "").trim();
-				if (!argPath) {
-					const currentWs = this.resolveWorkspace(sender, cfg) || "(默认跟随宿主当前项目)";
-					await this.sendRoomMessage(
-						roomId,
-						`📂 当前项目根目录：${currentWs}\n提示：发送 /cwd <目录路径> 可切换项目根目录。`,
-					).catch(() => {});
-					return true;
+			case "/help":
+				await reply(
+					"🔮 Matrix 机器人帮助\n/help /new /clear (/reset) /status /stop (/abort)\n/model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default]\n/cwd [absolute path] (/workspace)\n图片作为附件传入支持视觉的模型；文件使用本地路径，语音和视频不自动转录或解码。E2EE 不支持。",
+				);
+				break;
+			case "/status":
+				await reply(
+					`Matrix: ${this.status.state}\n会话: ${this.userConversations.get(key) || "未开始"}\n运行: ${[...this.pendingRuns.values()].some((r) => r.key === key)}\n模型: ${prefs.model ?? cfg.model ?? "default"}\n思考: ${prefs.thinkingLevel ?? cfg.thinkingLevel ?? "default"}\ncwd: ${this.resolveWorkspace(key, cfg)}\n错误: ${this.status.lastError || "无"}`,
+				);
+				break;
+			case "/abort":
+			case "/stop": {
+				const download = this.downloads.get(key);
+				if (download) {
+					download.abort(new Error("附件下载已取消"));
+					this.downloads.delete(key);
 				}
-				this.userWorkspaces.set(sender, argPath);
-				const newId = `mtx_${sender.replace(/[^a-zA-Z0-9]/g, "_").slice(-12)}_${Date.now().toString(36)}`;
-				this.userConversations.set(sender, newId);
-				await this.sendRoomMessage(
-					roomId,
-					`📂 已将项目根目录切换为：${argPath}\n✨ 已自动为您开启该目录下的全新会话！`,
-				).catch(() => {});
-				return true;
+				const run = [...this.pendingRuns.values()].find((r) => r.key === key);
+				if (!run) {
+					await reply(download ? "附件下载已取消。" : "当前没有运行中的任务。");
+					break;
+				}
+				if (!run.runId) throw new Error("宿主未提供运行 ID，无法安全停止此任务");
+				const result = await this.host.abortRun?.(run.runId);
+				if (!result?.ok) throw new Error(result?.error || "宿主不支持停止任务");
+				await reply("已请求停止当前任务。");
+				break;
 			}
 			case "/clear":
-			case "/new": {
-				const newId = `mtx_${sender.replace(/[^a-zA-Z0-9]/g, "_").slice(-12)}_${Date.now().toString(36)}`;
-				this.userConversations.set(sender, newId);
-				await this.sendRoomMessage(roomId, "✨ 对话上下文已清空，已为您开启全新会话！").catch(() => {});
-				return true;
-			}
-			case "/status": {
-				const s = this.status;
-				const statusText = [
-					`🟢 **Matrix 机器人状态**`,
-					`- 账号：${s.botUserId || "在线"}`,
-					`- 运行状态：在线 (Sync 长轮询)`,
-					`- 已接收消息：${s.messagesReceived} 条`,
-					`- 已回复消息：${s.messagesReplied} 条`,
-				].join("\n");
-				await this.sendRoomMessage(roomId, statusText).catch(() => {});
-				return true;
-			}
+			case "/reset":
+			case "/new":
+				if ([...this.pendingRuns.values()].some((r) => r.key === key))
+					throw new Error("请先 /stop 并等待任务结束，再开启新会话。");
+				this.downloads.get(key)?.abort(new Error("已开启新会话"));
+				await this.resetScope(key);
+				this.userConversations.set(key, `mtx_${randomUUID()}`);
+				if (arg) return { prompt: arg, epoch: this.epochs.get(key) };
+				await reply("✨ 已开启全新会话（未删除历史）。");
+				break;
+			case "/model":
+				if (arg) {
+					if ([...this.pendingRuns.values()].some((r) => r.key === key))
+						throw new Error("请先 /stop 并等待任务结束，再切换模型。");
+					if (arg !== "default") {
+						const models = await this.host.models?.list?.();
+						if (!models?.some((m) => `${m.provider}/${m.id}` === arg))
+							throw new Error("未知或不可用模型；请使用 provider/id");
+					}
+					ensureIdle();
+					this.preferences.set(key, { ...prefs, model: arg === "default" ? "" : arg });
+					this.downloads.get(key)?.abort(new Error("模型已切换"));
+					await this.resetScope(key);
+					this.userConversations.delete(key);
+				}
+				await reply(`模型: ${this.preferences.get(key)?.model ?? cfg.model ?? "default"}`);
+				break;
+			case "/thinking":
+				if (arg) {
+					if (!["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(arg))
+						throw new Error("无效思考强度");
+					ensureIdle();
+					this.preferences.set(key, { ...prefs, thinkingLevel: arg === "default" ? "" : arg });
+					this.downloads.get(key)?.abort(new Error("思考强度已切换"));
+					await this.resetScope(key);
+					this.userConversations.delete(key);
+				}
+				await reply(`思考: ${this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel ?? "default"}`);
+				break;
+			case "/workspace":
+			case "/cwd":
+				if (arg) {
+					if (!isAbsolute(arg)) throw new Error("cwd 必须是绝对目录");
+					const stat = await this.host.fs.statPath(arg);
+					if (stat.type !== "dir") throw new Error("cwd 必须是目录");
+					ensureIdle();
+					this.downloads.get(key)?.abort(new Error("工作区已切换"));
+					await this.resetScope(key);
+					this.userWorkspaces.set(key, arg);
+					this.userConversations.delete(key);
+				}
+				await reply(`cwd: ${this.resolveWorkspace(key, cfg)}`);
+				break;
 			default:
-				return false;
+				await reply(`未知命令：${command}。使用 /help 查看支持的命令。`);
 		}
+		return true;
 	}
 
 	async handleRunEvent(ev) {
-		const convId = ev.conversationId;
-		if (!convId) return;
-
-		if (ev.type === "message" && ev.message) {
-			const m = ev.message;
-			let content = "";
-			if (typeof m.content === "string") content = m.content;
-			else if (Array.isArray(m.content)) {
-				content = m.content
-					.map((c) => (typeof c === "string" ? c : c.text || ""))
-					.join("\n")
-					.trim();
+		await this.loadRouting();
+		const identity = this.sessionKey(ev);
+		const id = ev.runId ? `run:${ev.runId}` : identity;
+		if (!id || this.completedRuns.has(id)) return;
+		let run = this.pendingRuns.get(id);
+		if (!run && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRoutes.get(identity);
+			if (this.validRoute(route)) {
+				run = {
+					...route,
+					sessionId: ev.sessionId,
+					clientId: ev.clientId,
+					conversationId: ev.conversationId,
+					generation: this.routingGeneration,
+					accumulatedText: "",
+					web: true,
+				};
+				this.pendingRuns.set(id, run);
 			}
-
-			if (content && (m.role === "assistant" || m.author === "assistant")) {
-				if (this.pendingRuns.has(convId)) {
-					const r = this.pendingRuns.get(convId);
-					r.accumulatedText += (r.accumulatedText ? "\n" : "") + content;
-				} else {
-					let early = this.earlyRuns.get(convId);
-					if (!early) {
-						early = { accumulatedText: "" };
-						this.earlyRuns.set(convId, early);
-					}
-					early.accumulatedText += (early.accumulatedText ? "\n" : "") + content;
-				}
+		}
+		if (!run) {
+			if (this.dispatching && (ev.type === "message" || ev.type === "run_end")) {
+				const early = this.earlyRuns.get(id) || {};
+				if (ev.type === "run_end") early.end = ev;
+				else if (ev.message?.role === "assistant" || ev.message?.author === "assistant") early.message = ev;
+				this.earlyRuns.set(id, early);
 			}
 			return;
 		}
-
+		const account = this.routingAccount;
+		const isCurrent = () =>
+			account === this.accountIdentity() &&
+			run.generation === this.routingGeneration &&
+			run.epoch === (this.epochs.get(run.key) || 0);
+		if (!isCurrent() || run.ended) return;
+		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
+			const content = ev.message.content;
+			run.accumulatedText =
+				ev.message.stopReason === "toolUse" ||
+				(Array.isArray(content) && content.some((part) => part.type === "toolCall"))
+					? ""
+					: typeof content === "string"
+						? content
+						: (content || [])
+								.filter((part) => typeof part === "string" || part.type === "text")
+								.map((part) => (typeof part === "string" ? part : part.text || ""))
+								.join("\n");
+		}
 		if (ev.type === "run_end") {
-			const run = this.pendingRuns.get(convId) || this.earlyRuns.get(convId);
-			if (!run) return;
-
-			this.pendingRuns.delete(convId);
-			this.earlyRuns.delete(convId);
-
-			const rawText = run.accumulatedText || "";
-			const cleanText = stripInternalMarkers(rawText);
-			const finalText = cleanText || "✅ 任务已完成（无文本输出）。";
-
-			const chunks = chunkMarkdownText(finalText, 3800);
-
-			try {
-				for (const chunk of chunks) {
-					await this.sendRoomMessage(run.roomId, chunk);
-				}
-				this.status.messagesReplied++;
-				this.status.lastReplyAt = Date.now();
-			} catch (err) {
-				this.log("warn", `Matrix reply delivery failed: ${err.message}`);
+			run.ended = true;
+			if (ev.runId) {
+				this.completedRuns.add(id);
+				while (this.completedRuns.size > 500) this.completedRuns.delete(this.completedRuns.values().next().value);
 			}
+			for (const [pendingId, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(pendingId);
+			const ending =
+				ev.stopReason === "aborted"
+					? "任务已停止。"
+					: ev.isError || ev.error || ev.stopReason === "error"
+						? `任务失败：${ev.error || "模型运行错误"}`
+						: "";
+			const text =
+				[stripInternalMarkers(run.accumulatedText), ending].filter(Boolean).join("\n\n") || "任务结束（无文本输出）。";
+			for (const chunk of chunkMarkdownText(text, 3800)) {
+				if (!isCurrent()) break;
+				await this.feedback(run.roomId, chunk, run.threadId, isCurrent);
+			}
+			this.status.messagesReplied++;
+			this.status.lastReplyAt = Date.now();
 		}
 	}
 }
@@ -493,12 +878,18 @@ export function mergeSavedSecrets(incoming, prev = {}, savedSecrets = {}) {
 
 export default async function activate(host) {
 	let localConfig = (await host.storage.get("config")) || {};
+	let sessionMap = (await host.storage.get("channelSessions")) || {};
 	const savedSecrets = (await host.secrets?.getAll?.()) || {};
 	localConfig = mergeSavedSecrets(localConfig, {}, savedSecrets);
 
 	const botBridge = new MatrixBotBridge({
 		host,
 		getConfig: () => localConfig,
+		getSessionMap: () => sessionMap,
+		setSessionMap: async (next) => {
+			sessionMap = next && typeof next === "object" && !Array.isArray(next) ? next : {};
+			await host.storage.set("channelSessions", sessionMap);
+		},
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
 
@@ -529,10 +920,11 @@ export default async function activate(host) {
 					type: "string",
 					description: "send: target Matrix room ID (!xxx:server).",
 				},
-				text: {
-					type: "string",
-					description: "send: message content to send.",
-				},
+				text: { type: "string", description: "send: message content to send." },
+				path: { type: "string", description: "send: local media path inside workspace." },
+				media_type: { type: "string", enum: ["image", "audio", "file", "video"] },
+				mimetype: { type: "string" },
+				thread_id: { type: "string" },
 			},
 			required: ["action"],
 		},
@@ -545,7 +937,15 @@ export default async function activate(host) {
 					if (!localConfig.homeserverUrl || !localConfig.accessToken) {
 						throw new Error("Matrix credentials are not configured.");
 					}
-					await botBridge.sendRoomMessage(roomId, args.text || "");
+					if (args.path)
+						await sendMedia(botBridge, roomId, {
+							path: args.path,
+							type: args.media_type,
+							mimetype: args.mimetype,
+							text: args.text,
+							threadId: args.thread_id,
+						});
+					else await botBridge.sendRoomMessage(roomId, args.text || "", args.thread_id);
 					return JSON.stringify({ success: true, roomId }, null, 2);
 				}
 				case "status": {
@@ -558,7 +958,13 @@ export default async function activate(host) {
 	});
 
 	// Handle UI client messages
-	host.onClientMessage?.(async (msg, reply) => {
+	host.onClientMessage?.(async (msg, replyRaw) => {
+		const requestId = typeof msg?.reqId === "string" ? msg.reqId : "";
+		const reply = (payload) =>
+			replyRaw({
+				...payload,
+				...(requestId ? { reqId: requestId } : {}),
+			});
 		try {
 			switch (msg.type) {
 				case "get_state": {
@@ -571,6 +977,7 @@ export default async function activate(host) {
 							workspace: localConfig.workspace || "",
 							model: localConfig.model || "",
 							thinkingLevel: localConfig.thinkingLevel || "",
+							systemPrompt: normalizeMatrixSystemPrompt(localConfig.systemPrompt),
 							botEnabled: Boolean(localConfig.botEnabled),
 							allowedUsers: localConfig.allowedUsers || [],
 							hasAccessToken: Boolean(secrets[SECRET_ACCESS_TOKEN] || localConfig.accessToken),
@@ -584,7 +991,10 @@ export default async function activate(host) {
 				case "save_config": {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
+					await botBridge.loadRouting();
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					localConfig.systemPrompt = normalizeMatrixSystemPrompt(localConfig.systemPrompt);
+					if (botBridge.routingAccount !== botBridge.accountIdentity()) await botBridge.invalidateRouting();
 
 					if (host.secrets) {
 						if (localConfig.accessToken) {
@@ -613,7 +1023,12 @@ export default async function activate(host) {
 					const testCfg = mergeSavedSecrets(incoming, localConfig, secrets);
 
 					if (!testCfg.homeserverUrl || !testCfg.accessToken) {
-						reply({ type: "test_config_done", success: false, message: "未填入 Homeserver URL 或 Access Token" });
+						reply({
+							type: "test_config_done",
+							success: false,
+							message: "未填入 Homeserver URL 或 Access Token",
+							messageEn: "Homeserver URL and Access Token are required.",
+						});
 						break;
 					}
 
@@ -630,9 +1045,16 @@ export default async function activate(host) {
 							type: "test_config_done",
 							success: true,
 							message: `连接成功！已验证 Matrix 用户：${whoami.user_id}`,
+							messageEn: `Connection successful. Verified Matrix user: ${whoami.user_id}`,
 						});
 					} catch (err) {
-						reply({ type: "test_config_done", success: false, message: `连接失败: ${err.message}` });
+						const detail = formatMatrixError(err);
+						reply({
+							type: "test_config_done",
+							success: false,
+							message: `连接失败: ${detail}`,
+							messageEn: `Connection failed: ${detail}`,
+						});
 					}
 					break;
 				}
@@ -669,7 +1091,7 @@ export default async function activate(host) {
 					break;
 			}
 		} catch (err) {
-			reply({ type: "error", message: err.message });
+			reply({ type: "error", message: formatMatrixError(err) });
 		}
 	});
 
