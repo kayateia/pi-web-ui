@@ -93,7 +93,7 @@ describe("Matrix persistent session routing", () => {
 		await restored.emit({ ...web, type: "run_start" });
 		await restored.send("room", "/stop");
 		expect(restored.host.abortRun).not.toHaveBeenCalled();
-		expect(restored.bridge.feedback).toHaveBeenCalledWith("room", expect.stringContaining("运行 ID"), "thread");
+		expect(restored.bridge.feedback).toHaveBeenCalledWith("room", expect.stringContaining("run ID"), "thread");
 		restored.bridge.feedback.mockClear();
 		await restored.emit({ ...web, type: "message", message: { role: "assistant", content: "final" } });
 		await Promise.all([restored.emit({ ...web, type: "run_end" }), restored.emit({ ...web, type: "run_end" })]);
