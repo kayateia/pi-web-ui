@@ -5,9 +5,37 @@
 
 export default {
 	async mount(el, ctx) {
-		const sendHost = async (type, payload = {}) => {
-			return await ctx.send({ type, ...payload });
-		};
+		let requestSeq = 0;
+		const pending = new Map();
+		const offData = ctx.onData?.((payload) => {
+			const requestId = typeof payload?.reqId === "string" ? payload.reqId : "";
+			const waiter = requestId ? pending.get(requestId) : undefined;
+			if (!waiter) return;
+			pending.delete(requestId);
+			clearTimeout(waiter.timer);
+			waiter.resolve(payload);
+		});
+		const sendHost = (type, payload = {}) =>
+			new Promise((resolve, reject) => {
+				const reqId = `matrix-${Date.now()}-${++requestSeq}`;
+				const timer = setTimeout(() => {
+					pending.delete(reqId);
+					reject(new Error(`Matrix UI request timed out while waiting for "${type}".`));
+				}, 25_000);
+				pending.set(reqId, { resolve, reject, timer });
+				try {
+					const sent = ctx.send({ type, reqId, ...payload });
+					if (sent === false) {
+						clearTimeout(timer);
+						pending.delete(reqId);
+						reject(new Error(`Matrix UI request "${type}" could not be sent.`));
+					}
+				} catch (error) {
+					clearTimeout(timer);
+					pending.delete(reqId);
+					reject(error);
+				}
+			});
 
 		el.innerHTML = `
 			<div class="matrix-root" style="display: flex; flex-direction: column; height: 100%; box-sizing: border-box; background: var(--bg); color: var(--text); font-size: 13px;">
@@ -275,10 +303,17 @@ export default {
 				homeserverUrl: cfgHomeserver.value.trim() || "https://matrix.org",
 				accessToken: cfgToken.value.trim(),
 			};
-			const res = await sendHost("test_config", { config: testCfg });
-			btn.disabled = false;
-			btn.textContent = "🔌 测试连接";
-			alert?.(res?.message || (res?.success ? "连接测试通过！" : "测试失败"));
+			try {
+				const res = await sendHost("test_config", { config: testCfg });
+				const detail =
+					res?.message || res?.error || (res?.success ? "连接测试通过！" : `测试失败: ${JSON.stringify(res)}`);
+				alert?.(detail);
+			} catch (error) {
+				alert?.(`测试失败: ${error.message}`);
+			} finally {
+				btn.disabled = false;
+				btn.textContent = "🔌 测试连接";
+			}
 		});
 
 		q(".matrix-btn-save-cfg").addEventListener("click", async () => {
@@ -300,15 +335,20 @@ export default {
 				thinkingLevel: cfgThinking.value,
 			};
 
-			const res = await sendHost("save_config", { config: newCfg });
-			btn.disabled = false;
-			btn.textContent = "💾 保存配置";
-
-			if (res?.success) {
-				modal.style.display = "none";
-				refresh();
-			} else {
-				alert?.(`保存失败: ${res?.message || "未知错误"}`);
+			try {
+				const res = await sendHost("save_config", { config: newCfg });
+				if (res?.success) {
+					modal.style.display = "none";
+					refresh();
+				} else {
+					const detail = res?.message || res?.error || `服务端返回失败但没有 error 字段: ${JSON.stringify(res)}`;
+					alert?.(`保存失败: ${detail}`);
+				}
+			} catch (error) {
+				alert?.(`保存失败: ${error.message}`);
+			} finally {
+				btn.disabled = false;
+				btn.textContent = "💾 保存配置";
 			}
 		});
 
@@ -340,8 +380,11 @@ export default {
 					alert?.("✅ Matrix 消息发送成功！");
 					textInput.value = "";
 				} else {
-					alert?.(`发送失败: ${res?.message || "未知错误"}`);
+					const detail = res?.message || res?.error || `服务端返回失败但没有 error 字段: ${JSON.stringify(res)}`;
+					alert?.(`发送失败: ${detail}`);
 				}
+			} catch (error) {
+				alert?.(`发送失败: ${error.message}`);
 			} finally {
 				btn.disabled = false;
 				btn.textContent = "🚀 发送消息";
@@ -349,5 +392,13 @@ export default {
 		});
 
 		await refresh();
+		return () => {
+			offData?.();
+			for (const waiter of pending.values()) {
+				clearTimeout(waiter.timer);
+				waiter.reject(new Error("Matrix panel closed."));
+			}
+			pending.clear();
+		};
 	},
 };
