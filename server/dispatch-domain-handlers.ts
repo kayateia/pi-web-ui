@@ -462,7 +462,7 @@ export function handleSessionLifecycleMessage(
 				});
 			};
 			void cs
-				.newChat(msg.preset, msg.ephemeral, acknowledge, msg.independent)
+				.newChat(msg.preset, msg.ephemeral, acknowledge, msg.independent, msg.categoryId)
 				.then(() => acknowledge())
 				.catch(() => acknowledge());
 			return true;
@@ -515,6 +515,27 @@ export function handleSessionLifecycleMessage(
 			return true;
 		case "pin_session":
 			void cs.pinSession?.(msg.path, msg.pinned);
+			return true;
+		case "list_conversation_categories":
+			cs.pushConversationCategories?.();
+			return true;
+		case "create_conversation_category":
+			void cs.createConversationCategory?.(msg.name);
+			return true;
+		case "rename_conversation_category":
+			void cs.renameConversationCategory?.(msg.id, msg.name);
+			return true;
+		case "delete_conversation_category":
+			void cs.deleteConversationCategory?.(msg.id);
+			return true;
+		case "set_conversation_category":
+			void cs.setConversationCategory?.(
+				{
+					...(msg.conversationId ? { conversationId: msg.conversationId } : {}),
+					...(msg.path ? { path: msg.path } : {}),
+				},
+				msg.categoryId,
+			);
 			return true;
 		case "dismiss_finished_subagents":
 			void cs.dismissFinishedSubagents(msg.parentId);

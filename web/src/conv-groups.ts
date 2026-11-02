@@ -5,12 +5,56 @@
  * 抽成纯函数是为了那个「切项目时项目名闪一下」的坑（#140 的回归），有单测：
  * `tests/unit/conv-groups.test.ts`。
  */
-import type { ConversationSummary } from "./types";
+import type { ConversationCategory, ConversationSummary } from "./types";
 
 interface ConvGroup {
 	cwd: string;
 	isCurrent: boolean;
 	convs: ConversationSummary[];
+}
+
+/** One user-defined category bucket; id=null is the virtual Uncategorized bucket. */
+export interface ConversationCategoryGroup<T> {
+	id: string | null;
+	name: string;
+	items: T[];
+}
+
+/**
+ * Group conversations or sessions into user-defined topic buckets.
+ *
+ * Category order comes from the durable category list. Pinned rows sort first
+ * inside each bucket without changing the relative order of the remaining rows.
+ * Unknown/stale category ids fall back to Uncategorized.
+ */
+export function groupByConversationCategory<T extends { categoryId?: string; pinned?: boolean }>(
+	items: readonly T[],
+	categories: readonly ConversationCategory[],
+	includeEmpty: boolean,
+): ConversationCategoryGroup<T>[] {
+	const known = new Map(categories.map((category) => [category.id, category]));
+	const buckets = new Map<string | null, T[]>();
+	for (const category of categories) buckets.set(category.id, []);
+	for (const item of items) {
+		const categoryId = item.categoryId && known.has(item.categoryId) ? item.categoryId : null;
+		const bucket = buckets.get(categoryId) ?? [];
+		bucket.push(item);
+		buckets.set(categoryId, bucket);
+	}
+	if (!buckets.has(null)) buckets.set(null, []);
+	const ordered: ConversationCategoryGroup<T>[] = categories.map((category) => ({
+		id: category.id,
+		name: category.name,
+		items: buckets.get(category.id) ?? [],
+	}));
+	ordered.push({ id: null, name: "", items: buckets.get(null) ?? [] });
+	return ordered
+		.filter((bucket) => includeEmpty || bucket.id === null || bucket.items.length > 0)
+		.map((bucket) => ({
+			...bucket,
+			items: [...bucket.items].sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned))),
+		}))
+		.filter((bucket) => includeEmpty || bucket.items.length > 0);
 }
 
 /**
