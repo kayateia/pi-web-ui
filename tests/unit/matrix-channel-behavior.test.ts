@@ -234,7 +234,8 @@ describe("Matrix channel behavior", () => {
 			}),
 		);
 		await bridge.feedback("!other", "reply");
-		expect(bridge.status.lastError).toBe("network down");
+		expect(bridge.status.lastError).toContain("https://matrix.test");
+		expect(bridge.status.lastError).toContain("network down");
 	});
 	it("uploads and sends every media type through the registered tool", async () => {
 		const { host, sent } = setup();

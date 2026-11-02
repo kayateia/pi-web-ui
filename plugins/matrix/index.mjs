@@ -42,10 +42,43 @@ export function extractMatrixText(content = {}, botUserId = "") {
 	return text;
 }
 
+/** Format nested fetch/timeout causes without including credentials. */
+export function formatMatrixError(error) {
+	if (!(error instanceof Error)) return String(error ?? "unknown error");
+	const parts = [error.message || error.name || "unknown error"];
+	let cause = error.cause;
+	for (let depth = 0; cause && depth < 3; depth += 1) {
+		if (cause instanceof Error) {
+			const code =
+				typeof cause.code === "string" && cause.code && !parts.join(" ").includes(cause.code) ? ` (${cause.code})` : "";
+			if (cause.message && !parts.some((part) => part.includes(cause.message))) {
+				parts.push(`${cause.message}${code}`);
+			}
+			cause = cause.cause;
+		} else if (typeof cause === "object" && cause && "code" in cause) {
+			const code = String(cause.code ?? "").trim();
+			if (code && !parts.join(" ").includes(code)) parts.push(code);
+			break;
+		} else {
+			break;
+		}
+	}
+	return parts.join(": ");
+}
+
 /**
  * Matrix Client-Server API request helper.
  */
 export async function matrixApi(homeserverUrl, accessToken, method, path, payload = null, { timeoutMs = 35000 } = {}) {
+	let parsedUrl;
+	try {
+		parsedUrl = new URL(String(homeserverUrl ?? ""));
+	} catch {
+		throw new Error(`Invalid Matrix homeserver URL: ${homeserverUrl || "(empty)"}`);
+	}
+	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+		throw new Error("Matrix homeserver URL must use http:// or https://");
+	}
 	const base = homeserverUrl.replace(/\/+$/, "");
 	const subpath = path.startsWith("/") ? path : `/${path}`;
 	const url = `${base}${subpath}`;
@@ -60,19 +93,45 @@ export async function matrixApi(homeserverUrl, accessToken, method, path, payloa
 		headers["Content-Type"] = "application/json; charset=utf-8";
 	}
 
-	const res = await fetch(url, {
-		method,
-		headers,
-		body: payload !== null ? JSON.stringify(payload) : undefined,
-		signal: AbortSignal.timeout(timeoutMs),
-	});
-
-	if (!res.ok) {
-		const errJson = await res.json().catch(() => ({}));
-		throw new Error(errJson.error || `Matrix HTTP ${res.status}`);
+	let res;
+	try {
+		const request = {
+			method,
+			headers,
+			signal: AbortSignal.timeout(timeoutMs),
+		};
+		if (payload !== null) request.body = JSON.stringify(payload);
+		res = await fetch(url, request);
+	} catch (error) {
+		throw new Error(`Cannot reach Matrix homeserver ${base} for ${method} ${subpath}: ${formatMatrixError(error)}`, {
+			cause: error,
+		});
 	}
 
-	return await res.json().catch(() => ({}));
+	let json = {};
+	let text = "";
+	if (typeof res.text === "function") {
+		text = await res.text().catch(() => "");
+		if (text.trim()) {
+			try {
+				json = JSON.parse(text);
+			} catch {
+				json = {};
+			}
+		}
+	} else if (typeof res.json === "function") {
+		// Older/mock Response-shaped objects may expose json() only.
+		json = await res.json().catch(() => ({}));
+	}
+	if (!res.ok) {
+		const errcode = typeof json?.errcode === "string" && json.errcode ? ` [${json.errcode}]` : "";
+		const detail =
+			(typeof json?.error === "string" && json.error.trim()) ||
+			(text.trim() && !text.trim().startsWith("<") ? text.trim().slice(0, 500) : "");
+		throw new Error(`Matrix ${method} ${subpath} failed: HTTP ${res.status}${errcode}${detail ? ` - ${detail}` : ""}`);
+	}
+
+	return json;
 }
 
 /**
@@ -814,7 +873,13 @@ export default async function activate(host) {
 	});
 
 	// Handle UI client messages
-	host.onClientMessage?.(async (msg, reply) => {
+	host.onClientMessage?.(async (msg, replyRaw) => {
+		const requestId = typeof msg?.reqId === "string" ? msg.reqId : "";
+		const reply = (payload) =>
+			replyRaw({
+				...payload,
+				...(requestId ? { reqId: requestId } : {}),
+			});
 		try {
 			switch (msg.type) {
 				case "get_state": {
@@ -890,7 +955,7 @@ export default async function activate(host) {
 							message: `连接成功！已验证 Matrix 用户：${whoami.user_id}`,
 						});
 					} catch (err) {
-						reply({ type: "test_config_done", success: false, message: `连接失败: ${err.message}` });
+						reply({ type: "test_config_done", success: false, message: `连接失败: ${formatMatrixError(err)}` });
 					}
 					break;
 				}
@@ -927,7 +992,7 @@ export default async function activate(host) {
 					break;
 			}
 		} catch (err) {
-			reply({ type: "error", message: err.message });
+			reply({ type: "error", message: formatMatrixError(err) });
 		}
 	});
 
