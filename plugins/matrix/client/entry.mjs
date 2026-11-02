@@ -154,6 +154,11 @@ export default {
 									</div>
 								</div>
 								<div style="margin-top: 10px;">
+									<label style="display: block; margin-bottom: 4px; color: var(--text-dim);">${t("systemPromptLabel")}</label>
+									<textarea class="matrix-cfg-system-prompt" rows="6" placeholder="${t("systemPromptPlaceholder")}" style="width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); font-family: ui-monospace, monospace; font-size: 12px;"></textarea>
+									<div style="margin-top: 6px; color: var(--text-dim); font-size: 11px; line-height: 1.45;">${t("systemPromptHelp")}</div>
+								</div>
+								<div style="margin-top: 10px;">
 									<label style="display: block; margin-bottom: 4px; color: var(--text-dim);">${t("modelLabel")}</label>
 									<div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
 										<input type="text" class="matrix-cfg-model" placeholder="${t("modelPlaceholder")}" style="flex: 2; min-width: 180px; box-sizing: border-box; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; outline: none;" />
@@ -198,6 +203,7 @@ export default {
 		const cfgWorkspace = q(".matrix-cfg-workspace");
 		const cfgWsSelect = q(".matrix-cfg-ws-select");
 		const cfgWsBrowse = q(".matrix-cfg-ws-browse");
+		const cfgSystemPrompt = q(".matrix-cfg-system-prompt");
 		const cfgModel = q(".matrix-cfg-model");
 		const cfgModelBrowse = q(".matrix-cfg-model-browse");
 		const cfgThinking = q(".matrix-cfg-thinking");
@@ -246,6 +252,7 @@ export default {
 			cfgBotEnabled.checked = Boolean(cfg.botEnabled);
 			cfgAllowedUsers.value = Array.isArray(cfg.allowedUsers) ? cfg.allowedUsers.join(", ") : "";
 			cfgWorkspace.value = cfg.workspace || "";
+			cfgSystemPrompt.value = cfg.systemPrompt || "";
 			cfgModel.value = cfg.model || "";
 			cfgThinking.value = cfg.thinkingLevel || "";
 
@@ -337,6 +344,7 @@ export default {
 					.map((s) => s.trim())
 					.filter(Boolean),
 				workspace: cfgWorkspace.value.trim(),
+				systemPrompt: cfgSystemPrompt.value,
 				model: cfgModel.value.trim(),
 				thinkingLevel: cfgThinking.value,
 			};

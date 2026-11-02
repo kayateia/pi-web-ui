@@ -42,6 +42,17 @@ export function extractMatrixText(content = {}, botUserId = "") {
 	return text;
 }
 
+/** Normalize the Matrix gateway prompt for persistence and request assembly. */
+export function normalizeMatrixSystemPrompt(value) {
+	return String(value ?? "").slice(0, 32_768);
+}
+
+/** Compose the additive Matrix prompt without replacing pi-web-ui's normal prompt. */
+export function composeMatrixSystemPrompt(systemPrompt) {
+	const text = String(systemPrompt ?? "").trim();
+	return text ? `Matrix gateway instructions:\n${text}` : "";
+}
+
 /** Format nested fetch/timeout causes without including credentials. */
 export function formatMatrixError(error) {
 	if (!(error instanceof Error)) return String(error ?? "unknown error");
@@ -142,11 +153,15 @@ export class MatrixBotBridge {
 	 * @param {object} options
 	 * @param {any} options.host
 	 * @param {() => any} options.getConfig
+	 * @param {() => Record<string, unknown>} [options.getSessionMap]
+	 * @param {(value: Record<string, unknown>) => Promise<void>} [options.setSessionMap]
 	 * @param {(level: string, msg: string) => void} [options.log]
 	 */
-	constructor({ host, getConfig, log } = {}) {
+	constructor({ host, getConfig, getSessionMap = () => ({}), setSessionMap = async () => {}, log } = {}) {
 		this.host = host;
 		this.getConfig = getConfig;
+		this.getSessionMap = getSessionMap;
+		this.setSessionMap = setSessionMap;
 		this.log = log || ((level, msg) => console.log(`[matrix-bot:${level}] ${msg}`));
 
 		this.running = false;
@@ -246,6 +261,7 @@ export class MatrixBotBridge {
 		this.earlyRuns.clear();
 		this.userConversations.clear();
 		this.epochs.clear();
+		await this.setSessionMap({});
 		await this.saveRouting();
 	}
 
@@ -422,6 +438,67 @@ export class MatrixBotBridge {
 		}
 	}
 
+	conversationStorageKey(key, epoch) {
+		return `matrix:${this.routingAccount}:${peerAccountId(key, "scope")}:g${epoch}`;
+	}
+
+	/**
+	 * Create or reopen the background conversation for a Matrix room scope.
+	 *
+	 * Matrix prompts use append mode so the normal pi-web-ui preamble, tool
+	 * guidance, and project context remain intact.
+	 */
+	async ensureConversation(key, roomId, sender, cfg, epoch, workspace) {
+		const systemPrompt = composeMatrixSystemPrompt(cfg.systemPrompt);
+		const ensure = this.host.conversations?.ensure;
+		if (typeof ensure !== "function") {
+			if (systemPrompt) {
+				throw new Error("Matrix system prompts require a pi-web-ui host with conversation profiles.");
+			}
+			const conversationId = this.userConversations.get(key) || `mtx_${randomUUID()}`;
+			this.userConversations.set(key, conversationId);
+			return { conversationId, managed: false };
+		}
+
+		const storageKey = this.conversationStorageKey(key, epoch);
+		const currentSessionMap = this.getSessionMap?.();
+		const sessionMap =
+			currentSessionMap && typeof currentSessionMap === "object" && !Array.isArray(currentSessionMap)
+				? currentSessionMap
+				: {};
+		const saved = sessionMap[storageKey] && typeof sessionMap[storageKey] === "object" ? sessionMap[storageKey] : {};
+		const model = this.preferences.get(key)?.model ?? cfg.model;
+		const thinkingLevel = this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel;
+		const result = await ensure.call(this.host.conversations, {
+			key: storageKey,
+			title: `Matrix · ${sender || roomId}`,
+			...(workspace ? { cwd: workspace } : {}),
+			systemPrompt,
+			systemPromptMode: "append",
+			...(saved.sessionFile ? { sessionFile: saved.sessionFile } : {}),
+			...(model ? { model } : {}),
+			...(thinkingLevel ? { thinkingLevel } : {}),
+		});
+		if (!result?.ok || !result.conversationId) {
+			throw new Error(result?.error || "Could not create or reopen the Matrix conversation.");
+		}
+
+		this.userConversations.set(key, result.conversationId);
+		const next = {
+			...sessionMap,
+			[storageKey]: {
+				conversationId: result.conversationId,
+				...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+				updatedAt: Date.now(),
+			},
+		};
+		while (Object.keys(next).length > 200) delete next[Object.keys(next)[0]];
+		await this.setSessionMap(next).catch((error) => {
+			this.log("warn", `Matrix conversation map persistence failed: ${error.message}`);
+		});
+		return { conversationId: result.conversationId, managed: true };
+	}
+
 	async onInboundMessage(roomId, event) {
 		await this.loadRouting();
 		if (!event || event.sender === this.botUserId || event.content?.msgtype === "m.notice") return;
@@ -486,8 +563,9 @@ export class MatrixBotBridge {
 			this.status.lastMessageAt = Date.now();
 			if ([...this.pendingRuns.values()].some((run) => run.key === key))
 				throw new Error("当前会话仍在运行，请先 /stop 或等待完成。");
-			const conversationId = this.userConversations.get(key) || `mtx_${randomUUID()}`;
-			this.userConversations.set(key, conversationId);
+			const conversation = await this.ensureConversation(key, roomId, sender, cfg, epoch, workspace);
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，取消旧消息派发");
+			const conversationId = conversation.conversationId;
 			const run = {
 				key,
 				epoch,
@@ -508,6 +586,7 @@ export class MatrixBotBridge {
 					...(attachments.length ? { attachments } : {}),
 					accountId: peerAccountId(`${key}:${this.epochs.get(key) || 0}`),
 					conversationId,
+					...(conversation.managed ? { strictConversationId: true } : {}),
 					...(workspace ? { cwd: workspace } : {}),
 					...Object.fromEntries(
 						Object.entries({
@@ -799,12 +878,18 @@ export function mergeSavedSecrets(incoming, prev = {}, savedSecrets = {}) {
 
 export default async function activate(host) {
 	let localConfig = (await host.storage.get("config")) || {};
+	let sessionMap = (await host.storage.get("channelSessions")) || {};
 	const savedSecrets = (await host.secrets?.getAll?.()) || {};
 	localConfig = mergeSavedSecrets(localConfig, {}, savedSecrets);
 
 	const botBridge = new MatrixBotBridge({
 		host,
 		getConfig: () => localConfig,
+		getSessionMap: () => sessionMap,
+		setSessionMap: async (next) => {
+			sessionMap = next && typeof next === "object" && !Array.isArray(next) ? next : {};
+			await host.storage.set("channelSessions", sessionMap);
+		},
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
 
@@ -892,6 +977,7 @@ export default async function activate(host) {
 							workspace: localConfig.workspace || "",
 							model: localConfig.model || "",
 							thinkingLevel: localConfig.thinkingLevel || "",
+							systemPrompt: normalizeMatrixSystemPrompt(localConfig.systemPrompt),
 							botEnabled: Boolean(localConfig.botEnabled),
 							allowedUsers: localConfig.allowedUsers || [],
 							hasAccessToken: Boolean(secrets[SECRET_ACCESS_TOKEN] || localConfig.accessToken),
@@ -907,6 +993,7 @@ export default async function activate(host) {
 					const secrets = (await host.secrets?.getAll?.()) || {};
 					await botBridge.loadRouting();
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					localConfig.systemPrompt = normalizeMatrixSystemPrompt(localConfig.systemPrompt);
 					if (botBridge.routingAccount !== botBridge.accountIdentity()) await botBridge.invalidateRouting();
 
 					if (host.secrets) {
@@ -936,7 +1023,12 @@ export default async function activate(host) {
 					const testCfg = mergeSavedSecrets(incoming, localConfig, secrets);
 
 					if (!testCfg.homeserverUrl || !testCfg.accessToken) {
-						reply({ type: "test_config_done", success: false, message: "未填入 Homeserver URL 或 Access Token" });
+						reply({
+							type: "test_config_done",
+							success: false,
+							message: "未填入 Homeserver URL 或 Access Token",
+							messageEn: "Homeserver URL and Access Token are required.",
+						});
 						break;
 					}
 
@@ -953,9 +1045,16 @@ export default async function activate(host) {
 							type: "test_config_done",
 							success: true,
 							message: `连接成功！已验证 Matrix 用户：${whoami.user_id}`,
+							messageEn: `Connection successful. Verified Matrix user: ${whoami.user_id}`,
 						});
 					} catch (err) {
-						reply({ type: "test_config_done", success: false, message: `连接失败: ${formatMatrixError(err)}` });
+						const detail = formatMatrixError(err);
+						reply({
+							type: "test_config_done",
+							success: false,
+							message: `连接失败: ${detail}`,
+							messageEn: `Connection failed: ${detail}`,
+						});
 					}
 					break;
 				}
