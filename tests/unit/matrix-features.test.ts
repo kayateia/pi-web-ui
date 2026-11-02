@@ -217,6 +217,8 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 				homeserverUrl: "https://matrix.org",
 				accessToken: "mock_token",
 				systemPrompt: "Always address the room moderator by name.",
+				model: "provider/model",
+				thinkingLevel: "high",
 			}),
 			getSessionMap: () => ({}),
 			setSessionMap,
@@ -232,6 +234,8 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 			expect.objectContaining({
 				systemPrompt: "Matrix gateway instructions:\nAlways address the room moderator by name.",
 				systemPromptMode: "append",
+				model: "provider/model",
+				thinkingLevel: "high",
 				title: "Matrix · @alice:matrix.org",
 			}),
 		);
@@ -241,6 +245,8 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 				strictConversationId: true,
 			}),
 		);
+		expect(chatSpy.mock.calls[0][0]).not.toHaveProperty("model");
+		expect(chatSpy.mock.calls[0][0]).not.toHaveProperty("thinkingLevel");
 		const persistedSessions = setSessionMap.mock.calls[0][0];
 		const persistedKey = Object.keys(persistedSessions).find((key) => key.endsWith(":g0"));
 		expect(persistedKey).toBeTruthy();
