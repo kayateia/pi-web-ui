@@ -69,8 +69,8 @@ describe("Matrix persistent session routing", () => {
 		resolve[0](receipts[0]);
 		await Promise.all([a, b]);
 		expect(ctx.bridge.feedback.mock.calls.map(([room, text]: any[]) => [room, text])).toEqual([
-			["room-b", "session-1"],
-			["room-a", "session-0"],
+			["room-b", "preamble\n\n--\n\nsession-1"],
+			["room-a", "preamble\n\n--\n\nsession-0"],
 		]);
 		expect(ctx.bridge.pendingRuns.size).toBe(0);
 	});
@@ -98,7 +98,12 @@ describe("Matrix persistent session routing", () => {
 		await restored.emit({ ...web, type: "message", message: { role: "assistant", content: "final" } });
 		await Promise.all([restored.emit({ ...web, type: "run_end" }), restored.emit({ ...web, type: "run_end" })]);
 		expect(restored.bridge.feedback).toHaveBeenCalledTimes(1);
-		expect(restored.bridge.feedback).toHaveBeenCalledWith("room", "final", "thread", expect.any(Function));
+		expect(restored.bridge.feedback).toHaveBeenCalledWith(
+			"room",
+			"preamble\n\n--\n\nfinal",
+			"thread",
+			expect.any(Function),
+		);
 		expect([...restored.bridge.epochs.values()]).toEqual([1]);
 		await restored.emit({ ...web, type: "run_start" });
 		await restored.emit({ ...web, type: "run_end" });
@@ -106,7 +111,38 @@ describe("Matrix persistent session routing", () => {
 		await restored.bridge.stop();
 	});
 
-	it("does not borrow a session for an unknown rid or bare c1, ignores tool preambles", async () => {
+	it("concatenates every completed assistant message around tool calls", async () => {
+		const ctx = setup();
+		await ctx.send("room");
+		const receipt = await ctx.host.chat.mock.results[0].value;
+		ctx.bridge.feedback.mockClear();
+		const toolEvent = {
+			...receipt,
+			type: "message",
+			message: {
+				role: "assistant",
+				stopReason: "toolUse",
+				content: [{ type: "text", text: "tool preamble" }, { type: "toolCall" }],
+			},
+		};
+
+		await ctx.event(receipt, "message", "First response");
+		await ctx.bridge.handleRunEvent(toolEvent);
+		await ctx.event(receipt, "message", "Second response");
+		await ctx.bridge.handleRunEvent(toolEvent);
+		await ctx.event(receipt, "message", "Third response");
+		await ctx.event(receipt, "run_end");
+
+		expect(ctx.bridge.feedback).toHaveBeenCalledTimes(1);
+		expect(ctx.bridge.feedback).toHaveBeenCalledWith(
+			"room",
+			"First response\n\n--\n\nSecond response\n\n--\n\nThird response",
+			"thread",
+			expect.any(Function),
+		);
+	});
+
+	it("does not borrow a session for an unknown rid or bare c1, and ignores tool preambles", async () => {
 		const ctx = setup();
 		await ctx.send("room");
 		const receipt = await finishInbound(ctx);
@@ -127,7 +163,7 @@ describe("Matrix persistent session routing", () => {
 			},
 		});
 		await ctx.event(web, "run_end");
-		expect(ctx.bridge.feedback.mock.calls[0][1]).toBe("任务结束（无文本输出）。");
+		expect(ctx.bridge.feedback.mock.calls[0][1]).toBe("preamble");
 	});
 
 	it.each(["account", "stop"])("stops remaining chunks after %s changes during delivery", async (change) => {
