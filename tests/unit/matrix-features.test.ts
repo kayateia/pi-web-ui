@@ -6,14 +6,28 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+// @ts-expect-error jsdom does not ship declarations in this workspace
+import { JSDOM } from "jsdom";
 import {
 	extractMatrixText,
+	formatMatrixError,
+	matrixApi,
 	MatrixBotBridge,
 	peerAccountId,
 	stripInternalMarkers,
 } from "../../plugins/matrix/index.mjs";
+import activateMatrixPlugin from "../../plugins/matrix/index.mjs";
+import matrixClient from "../../plugins/matrix/client/entry.mjs";
+import { matrixTranslator, resolveMatrixLocale } from "../../plugins/matrix/client/i18n.mjs";
 
 describe("Matrix 纯函数与辅助方法测试", () => {
+	it("translates the Matrix panel from the host locale", () => {
+		expect(resolveMatrixLocale("zh-TW")).toBe("zh");
+		expect(resolveMatrixLocale("en-US")).toBe("en");
+		expect(matrixTranslator("zh")("messageCount", { count: 3 })).toBe("3 条");
+		expect(matrixTranslator("en")("messageCount", { count: 3 })).toBe("3 messages");
+	});
+
 	it("stripInternalMarkers 剥离内部标记与清理空行", () => {
 		const raw = "这是回答[[plan:123]]中间内容[[conv:xyz]]结尾。\n\n\n新行";
 		expect(stripInternalMarkers(raw)).toBe("这是回答中间内容结尾。\n\n新行");
@@ -98,7 +112,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_mtx_1" });
+		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_mtx_1", runId: "run_mtx_1" });
 
 		const bridge = new MatrixBotBridge({
 			host: {
@@ -129,10 +143,11 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 			}),
 		);
 
-		const convId = chatSpy.mock.calls[0][0].conversationId;
+		const convId = "conv_mtx_1";
 
 		runHandler!({
 			conversationId: convId,
+			runId: "run_mtx_1",
 			type: "message",
 			message: {
 				role: "assistant",
@@ -141,7 +156,8 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 		});
 
 		await runHandler!({
-			conversationId: convId,
+			conversationId: "renamed_mtx_1",
+			runId: "run_mtx_1",
 			type: "run_end",
 		});
 
@@ -190,5 +206,131 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 			content: { msgtype: "m.text", body: "用户正常提问" },
 		});
 		expect(chatSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("Matrix configuration diagnostics", () => {
+	it("echoes the UI request id on server replies", async () => {
+		let onClientMessage: ((message: unknown, reply: (payload: unknown) => void) => void | Promise<void>) | undefined;
+		const host = {
+			cwd: "/workspace",
+			storage: { get: async () => undefined, set: async () => {} },
+			secrets: { getAll: async () => ({}), set: async () => {}, delete: async () => {} },
+			onClientMessage: (handler: typeof onClientMessage) => {
+				onClientMessage = handler;
+				return () => {};
+			},
+			log: () => {},
+			notify: () => {},
+		};
+		const cleanup = await activateMatrixPlugin(host);
+		let replyPayload: Record<string, unknown> | undefined;
+		await onClientMessage?.({ type: "get_state", reqId: "matrix-state-1" }, (payload) => {
+			replyPayload = payload as Record<string, unknown>;
+		});
+		expect(replyPayload).toMatchObject({
+			type: "state",
+			reqId: "matrix-state-1",
+		});
+		await cleanup();
+	});
+
+	it("includes HTTP status, Matrix errcode, and server error text", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ errcode: "M_FORBIDDEN", error: "Invalid access token" }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+		await expect(
+			matrixApi("https://matrix.example", "expired", "GET", "/_matrix/client/v3/account/whoami"),
+		).rejects.toThrow(/HTTP 401.*M_FORBIDDEN.*Invalid access token/);
+		vi.unstubAllGlobals();
+	});
+
+	it("includes the homeserver URL and nested network cause", async () => {
+		const cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8008"), {
+			code: "ECONNREFUSED",
+		});
+		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed", { cause })));
+		await expect(
+			matrixApi("http://127.0.0.1:8008", "token", "GET", "/_matrix/client/v3/account/whoami"),
+		).rejects.toThrow(/http:\/\/127\.0\.0\.1:8008.*ECONNREFUSED/);
+		const error = new TypeError("fetch failed", { cause });
+		expect(formatMatrixError(error)).toContain("ECONNREFUSED");
+		vi.unstubAllGlobals();
+	});
+
+	it("shows the actual save error returned through plugin_data", async () => {
+		type ClientPayload = {
+			type?: string;
+			reqId?: string;
+			config?: Record<string, unknown>;
+			botStatus?: Record<string, unknown>;
+			hostCwd?: string;
+			success?: boolean;
+			message?: string;
+			[field: string]: unknown;
+		};
+		const dom = new JSDOM("<!doctype html><div id='root'></div>");
+		const previousWindow = globalThis.window;
+		const previousDocument = globalThis.document;
+		const previousAlert = globalThis.alert;
+		const alerts: string[] = [];
+		Object.assign(globalThis, {
+			window: dom.window,
+			document: dom.window.document,
+			alert: (message: unknown) => alerts.push(String(message)),
+		});
+		let dataHandler: ((payload: ClientPayload) => void) | undefined;
+		const ctx = {
+			send: (payload: ClientPayload) => {
+				const response =
+					payload.type === "get_state"
+						? {
+								type: "state",
+								reqId: payload.reqId,
+								config: { homeserverUrl: "https://matrix.example" },
+								botStatus: { state: "idle" },
+								hostCwd: "/workspace",
+							}
+						: {
+								type: "save_config_done",
+								reqId: payload.reqId,
+								success: false,
+								message: "Matrix POST /login failed: HTTP 403 [M_FORBIDDEN] - Invalid token",
+							};
+				queueMicrotask(() => dataHandler?.(response));
+				return true;
+			},
+			onData: (handler: (payload: ClientPayload) => void) => {
+				dataHandler = handler;
+				return () => {};
+			},
+		};
+		const root = dom.window.document.querySelector("#root");
+		const cleanup = await matrixClient.mount(root, ctx);
+		const deadline = Date.now() + 1000;
+		while (!root.querySelector(".matrix-btn-save-cfg") && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		expect(root.textContent).toContain("Matrix (decentralized) bot workspace");
+		expect(root.textContent).toContain("Configure credentials");
+		root.querySelector(".matrix-btn-save-cfg").dispatchEvent(new dom.window.Event("click"));
+		while (alerts.length === 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		expect(alerts[0]).toContain("HTTP 403");
+		expect(alerts[0]).toContain("M_FORBIDDEN");
+		expect(alerts[0]).toContain("Invalid token");
+		cleanup();
+		Object.assign(globalThis, {
+			window: previousWindow,
+			document: previousDocument,
+			alert: previousAlert,
+		});
 	});
 });
