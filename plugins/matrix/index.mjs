@@ -699,12 +699,14 @@ export class MatrixBotBridge {
 					conversationId,
 					...(conversation.managed ? { strictConversationId: true } : {}),
 					...(workspace ? { cwd: workspace } : {}),
-					...Object.fromEntries(
-						Object.entries({
-							model: this.preferences.get(key)?.model ?? cfg.model,
-							thinkingLevel: this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel,
-						}).filter(([, v]) => v),
-					),
+					...(conversation.managed
+						? {}
+						: Object.fromEntries(
+								Object.entries({
+									model: this.preferences.get(key)?.model ?? cfg.model,
+									thinkingLevel: this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel,
+								}).filter(([, value]) => value),
+							)),
 				});
 				if (
 					run.account !== this.accountIdentity() ||
