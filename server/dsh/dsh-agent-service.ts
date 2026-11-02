@@ -267,6 +267,7 @@ interface DshSettings {
 	/** 目标模式（目标条 + 调研向导 + 审查循环）总开关（默认开）。 */
 	goalModeEnabled: boolean;
 	thinkingWrap: boolean;
+	thinkingPreviewEnabled: boolean;
 	toolsWrap: boolean;
 	toolImagesEnabled: boolean;
 	/** 消息列表尾部常驻渲染的消息条数（纯 UI 偏好，默认 15）。 */
@@ -337,6 +338,7 @@ const DEFAULT_SETTINGS: DshSettings = {
 	goalModeEnabled: true,
 	parallelReminderEnabled: true,
 	thinkingWrap: false,
+	thinkingPreviewEnabled: true,
 	toolsWrap: true,
 	toolImagesEnabled: true,
 	keepRecentMessages: DEFAULT_KEEP_RECENT_MESSAGES,
@@ -594,6 +596,7 @@ export class DshClientSession {
 				goalModeEnabled: savedSettings.goalModeEnabled ?? true,
 				parallelReminderEnabled: savedSettings.parallelReminderEnabled ?? true,
 				thinkingWrap: savedSettings.thinkingWrap,
+				thinkingPreviewEnabled: savedSettings.thinkingPreviewEnabled ?? true,
 				toolsWrap: savedSettings.toolsWrap,
 				toolImagesEnabled: savedSettings.toolImagesEnabled ?? true,
 				keepRecentMessages: normalizeKeepRecentMessages(savedSettings.keepRecentMessages),
@@ -4178,6 +4181,7 @@ export class DshClientSession {
 			goalModeEnabled: this.settings.goalModeEnabled,
 			parallelReminderEnabled: this.settings.parallelReminderEnabled,
 			thinkingWrap: this.settings.thinkingWrap,
+			thinkingPreviewEnabled: this.settings.thinkingPreviewEnabled,
 			toolsWrap: this.settings.toolsWrap,
 			toolImagesEnabled: this.settings.toolImagesEnabled,
 			keepRecentMessages: normalizeKeepRecentMessages(this.settings.keepRecentMessages),
@@ -4263,6 +4267,7 @@ export class DshClientSession {
 		goalModeEnabled?: boolean;
 		parallelReminderEnabled?: boolean;
 		thinkingWrap?: boolean;
+		thinkingPreviewEnabled?: boolean;
 		toolsWrap?: boolean;
 		toolImagesEnabled?: boolean;
 		keepRecentMessages?: number;
@@ -4310,6 +4315,8 @@ export class DshClientSession {
 		if (partial.parallelReminderEnabled !== undefined)
 			this.settings.parallelReminderEnabled = partial.parallelReminderEnabled;
 		if (partial.thinkingWrap !== undefined) this.settings.thinkingWrap = partial.thinkingWrap;
+		if (partial.thinkingPreviewEnabled !== undefined)
+			this.settings.thinkingPreviewEnabled = partial.thinkingPreviewEnabled;
 		if (partial.toolsWrap !== undefined) this.settings.toolsWrap = partial.toolsWrap;
 		if (partial.toolImagesEnabled !== undefined) this.settings.toolImagesEnabled = partial.toolImagesEnabled;
 		if (partial.keepRecentMessages !== undefined)
@@ -4364,6 +4371,7 @@ export class DshClientSession {
 			goalModeEnabled: this.settings.goalModeEnabled,
 			parallelReminderEnabled: this.settings.parallelReminderEnabled,
 			thinkingWrap: this.settings.thinkingWrap,
+			thinkingPreviewEnabled: this.settings.thinkingPreviewEnabled,
 			toolsWrap: this.settings.toolsWrap,
 			toolImagesEnabled: this.settings.toolImagesEnabled,
 			keepRecentMessages: normalizeKeepRecentMessages(this.settings.keepRecentMessages),

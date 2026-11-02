@@ -2572,6 +2572,7 @@ export function App() {
 												onRemoveQueued={onRemoveQueued}
 												onRecallQueued={onRecallQueued}
 												thinkingWrap={chat.settings?.thinkingWrap ?? true}
+												thinkingPreviewEnabled={chat.settings?.thinkingPreviewEnabled ?? true}
 												toolsWrap={chat.settings?.toolsWrap ?? true}
 												toolImages={chat.settings?.toolImagesEnabled ?? true}
 												keepRecent={chat.settings?.keepRecentMessages}

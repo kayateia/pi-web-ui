@@ -661,6 +661,7 @@ interface SettingsPatch {
 	goalModeEnabled?: boolean;
 	parallelReminderEnabled?: boolean;
 	thinkingWrap?: boolean;
+	thinkingPreviewEnabled?: boolean;
 	toolsWrap?: boolean;
 	toolImagesEnabled?: boolean;
 	/** 消息列表尾部常驻渲染的消息条数（纯 UI 偏好，默认 15）。 */
@@ -4132,6 +4133,16 @@ export function SettingsModal({
 									tip={t("thinkingWrapDesc")}
 									enabled={settings.thinkingWrap ?? true}
 									onToggle={() => setPartial({ thinkingWrap: !(settings.thinkingWrap ?? true) })}
+								/>
+								<ToggleRow
+									title={t("thinkingQuietMode")}
+									tip={t("thinkingQuietModeDesc")}
+									enabled={!(settings.thinkingPreviewEnabled ?? true)}
+									onToggle={() =>
+										setPartial({
+											thinkingPreviewEnabled: !(settings.thinkingPreviewEnabled ?? true),
+										})
+									}
 								/>
 								<ToggleRow
 									title={t("toolsWrap")}

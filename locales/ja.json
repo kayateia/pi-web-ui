@@ -1703,6 +1703,8 @@
 		"uploadMaxMbHint": "Maximum size per file, an integer from 1 to 100 MB.",
 		"thinkingWrap": "思考をすべて表示します",
 		"thinkingWrapDesc": "オン：思考内容を常にすべて展開し、自動で折り返して表示します（ストリーミング中の推論過程もリアルタイムで見られます）。オフ：一行の要約に折りたたみ、ストリーミング中は一行で最新のテキストをリアルタイム表示します",
+		"thinkingQuietMode": "Hide thinking text until expanded",
+		"thinkingQuietModeDesc": "On: collapsed thinking shows only the active indicator and expand arrow, with no summary or marquee; this overrides Show full thinking until you open the block manually",
 		"toolsWrap": "ツールをすべて表示します",
 		"toolsWrapDesc": "オン：ツール呼び出しを常にすべて展開し、パラメータと出力を表示します。オフ：デフォルトで折りたたみ、クリックで展開します",
 		"toolImages": "ツール結果の画像を表示する",

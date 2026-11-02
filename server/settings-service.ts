@@ -573,6 +573,7 @@ export class SettingsService {
 				devNoCache: this.settings.devNoCache ?? this.defaultDevNoCache(),
 				autoReload: this.settings.autoReload ?? this.defaultDevNoCache(),
 				thinkingWrap: this.settings.thinkingWrap,
+				thinkingPreviewEnabled: this.settings.thinkingPreviewEnabled,
 				toolsWrap: this.settings.toolsWrap,
 				toolImagesEnabled: this.settings.toolImagesEnabled ?? true,
 				keepRecentMessages: normalizeKeepRecentMessages(this.settings.keepRecentMessages),
@@ -730,6 +731,7 @@ export class SettingsService {
 		parallelReminderEnabled?: boolean;
 		goalModeEnabled?: boolean;
 		thinkingWrap?: boolean;
+		thinkingPreviewEnabled?: boolean;
 		toolsWrap?: boolean;
 		toolImagesEnabled?: boolean;
 		/** 消息列表尾部常驻渲染的消息条数（默认 15 = 与原硬编码一致；纯 UI 偏好）。 */
@@ -922,6 +924,9 @@ export class SettingsService {
 		}
 		if (partial.thinkingWrap !== undefined) {
 			next.thinkingWrap = partial.thinkingWrap;
+		}
+		if (partial.thinkingPreviewEnabled !== undefined) {
+			next.thinkingPreviewEnabled = partial.thinkingPreviewEnabled;
 		}
 		if (partial.toolsWrap !== undefined) {
 			next.toolsWrap = partial.toolsWrap;

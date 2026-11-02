@@ -263,6 +263,8 @@ interface MessageProps {
 	onJump?: (messageId: string) => void;
 	/** 思考文本是否换行（设置面板开关；false = 不换行横向滚动）。 */
 	thinkingWrap?: boolean;
+	/** 折叠思考块时是否显示单行实时预览。 */
+	thinkingPreviewEnabled?: boolean;
 	/** 工具调用是否默认展开（设置面板开关；false = 默认折叠）。 */
 	toolsWrap?: boolean;
 	/** 工具结果图片直接显示（设置面板开关；false = 不渲染缩略图）。 */
@@ -318,6 +320,7 @@ export const Message = memo(function Message({
 	qnActive,
 	onJump,
 	thinkingWrap,
+	thinkingPreviewEnabled,
 	toolsWrap,
 	toolImages,
 	searchActive,
@@ -1389,6 +1392,7 @@ export const Message = memo(function Message({
 											toolsWrap={toolsWrap}
 											toolImages={toolImages}
 											thinkingWrap={thinkingWrap}
+											thinkingPreviewEnabled={thinkingPreviewEnabled}
 											searchActive={searchActive}
 											forceThinking={exportForceThinking}
 											forceTools={exportForceTools}
@@ -1417,6 +1421,7 @@ export const Message = memo(function Message({
 										toolsWrap={toolsWrap}
 										toolImages={toolImages}
 										thinkingWrap={thinkingWrap}
+										thinkingPreviewEnabled={thinkingPreviewEnabled}
 										searchActive={searchActive}
 										forceThinking={exportForceThinking}
 										forceTools={exportForceTools}
@@ -1445,6 +1450,7 @@ export const Message = memo(function Message({
 										toolsWrap={toolsWrap}
 										toolImages={toolImages}
 										thinkingWrap={thinkingWrap}
+										thinkingPreviewEnabled={thinkingPreviewEnabled}
 										searchActive={searchActive}
 										forceThinking={exportForceThinking}
 										forceTools={exportForceTools}
@@ -1862,6 +1868,7 @@ function Block({
 	isTrailingBlock,
 	onKillBash,
 	thinkingWrap,
+	thinkingPreviewEnabled,
 	toolsWrap,
 	toolImages,
 	searchActive,
@@ -1884,6 +1891,8 @@ function Block({
 	onKillBash?: () => void;
 	/** 思考文本是否换行（false = 不换行横向滚动）。 */
 	thinkingWrap?: boolean;
+	/** 折叠思考块时是否显示单行实时预览。 */
+	thinkingPreviewEnabled?: boolean;
 	/** 工具调用是否默认展开（false = 默认折叠）。 */
 	toolsWrap?: boolean;
 	/** 工具结果图片直接显示（false = 不渲染缩略图）。 */
@@ -1996,6 +2005,7 @@ function Block({
 				thinking={thinking.thinking}
 				streaming={streaming && isLast && isTrailing}
 				wrap={thinkingWrap}
+				previewEnabled={thinkingPreviewEnabled}
 				forceOpen={searchActive || forceThinking}
 			/>
 		);

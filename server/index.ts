@@ -1706,6 +1706,7 @@ export interface DispatchSession {
 		terminalBashMaxForegroundMs?: number;
 		editSoftEnabled?: boolean;
 		thinkingWrap?: boolean;
+		thinkingPreviewEnabled?: boolean;
 		toolsWrap?: boolean;
 		toolImagesEnabled?: boolean;
 		keepRecentMessages?: number;

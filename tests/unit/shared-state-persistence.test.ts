@@ -102,6 +102,15 @@ describe("authoritative shared settings", () => {
 		await a.svc.set({ promptOverrides: { soul: "" } });
 		expect(b.svc.current.promptOverrides).toEqual({ append: "b" });
 	});
+	it("persists the quiet thinking preview preference", async () => {
+		const path = file();
+		const store = new ClientStateStore(path);
+		const a = service(store, "a");
+		expect(a.svc.current.thinkingPreviewEnabled).toBe(true);
+		await a.svc.set({ thinkingPreviewEnabled: false });
+		expect(a.svc.current.thinkingPreviewEnabled).toBe(false);
+		expect(new ClientStateStore(path).getSettings("restart").thinkingPreviewEnabled).toBe(false);
+	});
 	it("partial presets keep other clients' latest settings", async () => {
 		const store = new ClientStateStore(file());
 		const a = service(store, "a");

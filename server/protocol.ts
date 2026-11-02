@@ -1244,6 +1244,9 @@ export type ClientMessage =
 			goalModeEnabled?: boolean;
 			/** 思考文本是否换行（默认开）。纯 UI 偏好，不需要 reload runtime。 */
 			thinkingWrap?: boolean;
+			/** 折叠思考块时是否显示单行实时预览（默认开）。关 → 折叠态不展示推理正文，
+			 *  仅在用户展开后显示。纯 UI 偏好，不需要 reload runtime。 */
+			thinkingPreviewEnabled?: boolean;
 			/** 工具调用是否默认展开（默认开）。纯 UI 偏好，不需要 reload runtime。 */
 			toolsWrap?: boolean;
 			/** 工具结果里的图片直接显示（默认开）。关 → 工具卡不渲染缩略图
@@ -3491,6 +3494,8 @@ export interface UiSettingsState {
 	goalModeEnabled: boolean;
 	/** 思考文本是否换行（默认开 = pre-wrap；关 = 长行横向滚动）。 */
 	thinkingWrap: boolean;
+	/** 折叠思考块时是否显示单行实时预览（默认开）。关 → 折叠态完全隐藏推理文本。 */
+	thinkingPreviewEnabled: boolean;
 	/** 开发模式：index.html 不缓存。默认跟安装方式（源码开/安装包关），设置可覆盖。 */
 	devNoCache?: boolean;
 	/** 新构建就绪自动重载页面。默认跟安装方式（源码开/安装包关），设置可覆盖。 */

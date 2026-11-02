@@ -2381,6 +2381,7 @@ export class UniversalSession implements DispatchSession {
 			goalModeEnabled: false,
 			parallelReminderEnabled: false,
 			thinkingWrap: s?.thinkingWrap ?? false,
+			thinkingPreviewEnabled: s?.thinkingPreviewEnabled ?? true,
 			toolsWrap: s?.toolsWrap ?? false,
 			toolImagesEnabled: s?.toolImagesEnabled ?? true,
 			keepRecentMessages: s?.keepRecentMessages ?? 0,
