@@ -547,11 +547,6 @@ export class MatrixBotBridge {
 						throw new Error("Unsupported image MIME type");
 					attachments.push({ path: "", imageData: bytes.toString("base64"), mimeType, name });
 				} else attachments.push({ path, mode: "reference", name });
-				await this.sendRoomMessage(
-					roomId,
-					`📎 已保存附件：${path}\n图片随附件传入支持视觉的模型；渠道不转录语音或解码视频。`,
-					threadId,
-				);
 			} else if (content.msgtype && !["m.text", "m.emote"].includes(content.msgtype))
 				throw new Error(`Unsupported Matrix message type: ${content.msgtype}`);
 			if (!text) return;
