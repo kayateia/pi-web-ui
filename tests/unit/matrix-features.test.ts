@@ -18,8 +18,16 @@ import {
 } from "../../plugins/matrix/index.mjs";
 import activateMatrixPlugin from "../../plugins/matrix/index.mjs";
 import matrixClient from "../../plugins/matrix/client/entry.mjs";
+import { matrixTranslator, resolveMatrixLocale } from "../../plugins/matrix/client/i18n.mjs";
 
 describe("Matrix 纯函数与辅助方法测试", () => {
+	it("translates the Matrix panel from the host locale", () => {
+		expect(resolveMatrixLocale("zh-TW")).toBe("zh");
+		expect(resolveMatrixLocale("en-US")).toBe("en");
+		expect(matrixTranslator("zh")("messageCount", { count: 3 })).toBe("3 条");
+		expect(matrixTranslator("en")("messageCount", { count: 3 })).toBe("3 messages");
+	});
+
 	it("stripInternalMarkers 剥离内部标记与清理空行", () => {
 		const raw = "这是回答[[plan:123]]中间内容[[conv:xyz]]结尾。\n\n\n新行";
 		expect(stripInternalMarkers(raw)).toBe("这是回答中间内容结尾。\n\n新行");
@@ -309,6 +317,8 @@ describe("Matrix configuration diagnostics", () => {
 		while (!root.querySelector(".matrix-btn-save-cfg") && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
+		expect(root.textContent).toContain("Matrix (decentralized) bot workspace");
+		expect(root.textContent).toContain("Configure credentials");
 		root.querySelector(".matrix-btn-save-cfg").dispatchEvent(new dom.window.Event("click"));
 		while (alerts.length === 0 && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, 5));
