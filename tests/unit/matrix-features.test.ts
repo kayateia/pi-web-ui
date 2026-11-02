@@ -11,6 +11,7 @@ import { JSDOM } from "jsdom";
 import {
 	composeMatrixSystemPrompt,
 	extractMatrixText,
+	formatMatrixPrompt,
 	formatMatrixError,
 	matrixApi,
 	MatrixBotBridge,
@@ -19,6 +20,7 @@ import {
 } from "../../plugins/matrix/index.mjs";
 import activateMatrixPlugin from "../../plugins/matrix/index.mjs";
 import matrixClient from "../../plugins/matrix/client/entry.mjs";
+import { matrixChatError, matrixChatText } from "../../plugins/matrix/chat-i18n.mjs";
 import { matrixTranslator, resolveMatrixLocale } from "../../plugins/matrix/client/i18n.mjs";
 
 describe("Matrix 纯函数与辅助方法测试", () => {
@@ -29,11 +31,24 @@ describe("Matrix 纯函数与辅助方法测试", () => {
 		expect(matrixTranslator("en")("messageCount", { count: 3 })).toBe("3 messages");
 	});
 
+	it("translates chat-facing gateway messages", () => {
+		expect(matrixChatText("en", "unknownCommand", { command: "/bad" })).toContain("Unknown command");
+		expect(matrixChatText("zh-TW", "unknownCommand", { command: "/bad" })).toContain("未知命令");
+		expect(matrixChatError("zh", new Error("Media exceeds 10 MiB limit"))).toContain("10 MiB");
+		expect(matrixChatError("zh", new Error("Media exceeds 10 MiB limit"))).toContain("媒体超过");
+	});
+
 	it("composes an additive Matrix prompt with the Signal-style heading", () => {
 		expect(composeMatrixSystemPrompt("  Stay within this room's rules.  ")).toBe(
 			"Matrix gateway instructions:\nStay within this room's rules.",
 		);
 		expect(composeMatrixSystemPrompt("   ")).toBe("");
+	});
+
+	it("attributes every Matrix prompt to its room and sender", () => {
+		expect(formatMatrixPrompt("!room:matrix.org", "@alice:matrix.org", " hello ")).toBe(
+			"[Matrix channel !room:matrix.org · sender @alice:matrix.org]: hello",
+		);
 	});
 
 	it("stripInternalMarkers 剥离内部标记与清理空行", () => {
@@ -104,7 +119,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 			expect.stringContaining("/send/m.room.message/"),
 			expect.objectContaining({
 				method: "PUT",
-				body: expect.stringContaining("Matrix 机器人帮助"),
+				body: expect.stringContaining("Matrix bot help"),
 			}),
 		);
 
@@ -146,7 +161,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 
 		expect(chatSpy).toHaveBeenCalledWith(
 			expect.objectContaining({
-				text: "帮我写一个函数",
+				text: "[Matrix channel !room1:matrix.org · sender @alice:matrix.org]: 帮我写一个函数",
 				accountId: expect.stringMatching(/^mtx_/),
 			}),
 		);
@@ -287,12 +302,13 @@ describe("Matrix configuration diagnostics", () => {
 		};
 		const cleanup = await activateMatrixPlugin(host);
 		let replyPayload: Record<string, unknown> | undefined;
-		await onClientMessage?.({ type: "get_state", reqId: "matrix-state-1" }, (payload) => {
+		await onClientMessage?.({ type: "get_state", reqId: "matrix-state-1", locale: "zh-TW" }, (payload) => {
 			replyPayload = payload as Record<string, unknown>;
 		});
 		expect(replyPayload).toMatchObject({
 			type: "state",
 			reqId: "matrix-state-1",
+			config: { locale: "zh" },
 		});
 		await cleanup();
 	});

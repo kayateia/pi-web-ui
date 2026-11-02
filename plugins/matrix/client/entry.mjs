@@ -7,7 +7,7 @@ import { matrixLocaleFromDocument, matrixTranslator } from "./i18n.mjs";
 
 export default {
 	async mount(el, ctx) {
-		const locale = matrixLocaleFromDocument();
+		let locale = matrixLocaleFromDocument();
 		const t = matrixTranslator(locale);
 		let requestSeq = 0;
 		const pending = new Map();
@@ -28,7 +28,7 @@ export default {
 				}, 25_000);
 				pending.set(reqId, { resolve, reject, timer });
 				try {
-					const sent = ctx.send({ type, reqId, ...payload });
+					const sent = ctx.send({ type, reqId, locale, ...payload });
 					if (sent === false) {
 						clearTimeout(timer);
 						pending.delete(reqId);
@@ -211,7 +211,7 @@ export default {
 		let currentState = {};
 
 		async function refresh() {
-			const res = await sendHost("get_state");
+			const res = await sendHost("get_state", { locale });
 			if (!res) return;
 			currentState = res;
 
@@ -411,8 +411,20 @@ export default {
 			}
 		});
 
+		const localeObserver =
+			typeof globalThis.MutationObserver === "function"
+				? new globalThis.MutationObserver(() => {
+						const next = matrixLocaleFromDocument();
+						if (next === locale) return;
+						locale = next;
+						ctx.send({ type: "set_locale", locale });
+					})
+				: null;
+		localeObserver?.observe(document.documentElement, { attributes: true, attributeFilter: ["lang"] });
+
 		await refresh();
 		return () => {
+			localeObserver?.disconnect();
 			offData?.();
 			for (const waiter of pending.values()) {
 				clearTimeout(waiter.timer);
