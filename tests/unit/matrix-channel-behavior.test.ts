@@ -182,6 +182,7 @@ describe("Matrix channel behavior", () => {
 			info: { mimetype: type === "image" ? "image/png" : "application/octet-stream" },
 		});
 		expect(host.fs.writePath).toHaveBeenCalledWith(expect.stringContaining(".matrix-media"), Buffer.from([1, 2, 3]));
+		expect(host.chat.mock.calls[0][0].text).toBe("example");
 		const attachment = host.chat.mock.calls[0][0].attachments[0];
 		if (type === "image")
 			expect(attachment).toEqual({ path: "", imageData: "AQID", mimeType: "image/png", name: "example" });

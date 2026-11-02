@@ -23,7 +23,7 @@
 
 ## 媒体与限制
 
-- 接收图片、音频（含语音）、文件、视频：从认证 Matrix media API 下载原始字节到所选工作区 `.matrix-media/`，再传给 `host.chat({text, attachments})`。PNG/JPEG/WebP/GIF 图片通过 `{path:"", imageData:base64, mimeType, name}` 传入；其他媒体用 `{path:absolutePath, mode:"reference", name}` 引用，并提示模型使用 read 或可用工具。视觉能力取决于模型；渠道不自动转录语音或解码视频，无法解析时必须说明。
+- 接收图片、音频（含语音）、文件、视频：从认证 Matrix media API 下载原始字节到所选工作区 `.matrix-media/`，再作为结构化附件传给 `host.chat({text, attachments})`。PNG/JPEG/WebP/GIF 图片通过 `{path:"", imageData:base64, mimeType, name}` 传入；其他媒体用 `{path:absolutePath, mode:"reference", name}` 引用。渠道不会额外把附件处理说明拼进用户消息，避免模型回显；视觉能力取决于模型，渠道本身不自动转录语音或解码视频。
 - 每个 Matrix 消息接收一个媒体附件，因此图片每次至多一张且不超过 10 MiB（低于宿主 8 张/合计 20 MiB 上限），其他附件不超过 25 MiB；流式读取同样限制字节数。文件保留在工作区，需自行清理。额外目录须事先在宿主授权，渠道不会绕过文件权限。
 - `matrix` 工具 `action=send` 支持 `path`（工作区内本地路径）、`media_type=image|audio|file|video`、`mimetype`、`text`、`thread_id`：真实读取文件、上传原始字节并发送相应 Matrix 媒体事件。路径越界、下载/上传/发送失败均返回错误；入站失败尝试回复原 thread，回复本身失败记录日志及状态错误。
 - **不支持 E2EE**：没有设备密钥、Olm/Megolm 解密、密钥备份或加密上传。加密房间消息和加密附件明确拒绝，出站先查房间状态并拒绝向加密房间发送明文。请使用机器人已加入的未加密房间；无法读取房间状态也会拒绝发送。无法解密的事件无法读取 thread 关系。

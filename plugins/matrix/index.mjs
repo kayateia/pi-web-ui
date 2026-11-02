@@ -547,7 +547,6 @@ export class MatrixBotBridge {
 						throw new Error("Unsupported image MIME type");
 					attachments.push({ path: "", imageData: bytes.toString("base64"), mimeType, name });
 				} else attachments.push({ path, mode: "reference", name });
-				text = `${text}\nReceived ${mediaTypes[content.msgtype]} saved at ${JSON.stringify(path)}. Use read on this local path where supported. Images are also attached as imageData for vision-capable models. Audio/video are not transcribed or decoded by the channel; explicitly report unavailable decoding tools.`;
 				await this.sendRoomMessage(
 					roomId,
 					`📎 已保存附件：${path}\n图片随附件传入支持视觉的模型；渠道不转录语音或解码视频。`,
