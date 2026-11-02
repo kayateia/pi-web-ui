@@ -109,7 +109,7 @@ describe("Matrix channel behavior", () => {
 		expect(host.chat).not.toHaveBeenCalled();
 		expect(host.fs.writePath).not.toHaveBeenCalled();
 	});
-	it("claims early message and run_end by stable runId despite renamed conversation IDs", async () => {
+	it("claims multiple early messages and run_end by stable runId despite renamed conversation IDs", async () => {
 		let bridge: any;
 		const chat = vi.fn(async () => {
 			await bridge.handleRunEvent({
@@ -117,6 +117,12 @@ describe("Matrix channel behavior", () => {
 				conversationId: "early-a",
 				runId: "stable",
 				message: { role: "assistant", content: "early answer" },
+			});
+			await bridge.handleRunEvent({
+				type: "message",
+				conversationId: "early-a",
+				runId: "stable",
+				message: { role: "assistant", content: "later answer" },
 			});
 			await bridge.handleRunEvent({ type: "run_end", conversationId: "early-b", runId: "stable" });
 			return { conversationId: "real", runId: "stable" };
@@ -126,7 +132,7 @@ describe("Matrix channel behavior", () => {
 		await result.inbound("hello");
 		expect([...bridge.userConversations.values()]).toEqual(["real"]);
 		expect(bridge.pendingRuns.size).toBe(0);
-		expect(result.sent.filter((s) => s.body === "early answer")).toHaveLength(1);
+		expect(result.sent.filter((s) => s.body === "early answer\n\n--\n\nlater answer")).toHaveLength(1);
 		expect(result.sent.at(-1)["m.relates_to"]).toEqual({ rel_type: "m.thread", event_id: "$thread" });
 	});
 	it("preserves early terminal state after many assistant events and marks partial aborts", async () => {

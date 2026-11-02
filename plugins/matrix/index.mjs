@@ -23,6 +23,32 @@ export function stripInternalMarkers(text) {
 		.trim();
 }
 
+/** Extract display text from a completed assistant message, excluding tool preambles. */
+function assistantResponseText(message) {
+	const content = message?.content;
+	if (
+		message?.stopReason === "toolUse" ||
+		(Array.isArray(content) && content.some((part) => ["toolCall", "tool_use", "function_call"].includes(part?.type)))
+	) {
+		return "";
+	}
+	const text =
+		typeof content === "string"
+			? content
+			: (content || [])
+					.filter((part) => typeof part === "string" || part?.type === "text")
+					.map((part) => (typeof part === "string" ? part : part.text || ""))
+					.join("\n");
+	return stripInternalMarkers(text);
+}
+
+/** Append a completed response segment while preserving earlier tool-assisted segments. */
+function appendResponseSegment(current, segment) {
+	const next = String(segment ?? "").trim();
+	if (!next) return current;
+	return current ? `${current}\n\n--\n\n${next}` : next;
+}
+
 /** Generates a stable, privacy-preserving accountId from Matrix User ID (@user:server). */
 export function peerAccountId(userId, prefix = "mtx") {
 	const raw = String(userId ?? "").trim();
@@ -615,7 +641,7 @@ export class MatrixBotBridge {
 				const earlyKey = pendingKey;
 				const early = this.earlyRuns.get(earlyKey);
 				this.earlyRuns.delete(earlyKey);
-				if (early?.message) await this.handleRunEvent(early.message);
+				for (const message of early?.messages || []) await this.handleRunEvent(message);
 				if (early?.end) await this.handleRunEvent(early.end);
 			} catch (err) {
 				for (const [id, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(id);
@@ -795,7 +821,10 @@ export class MatrixBotBridge {
 			if (this.dispatching && (ev.type === "message" || ev.type === "run_end")) {
 				const early = this.earlyRuns.get(id) || {};
 				if (ev.type === "run_end") early.end = ev;
-				else if (ev.message?.role === "assistant" || ev.message?.author === "assistant") early.message = ev;
+				else if (ev.message?.role === "assistant" || ev.message?.author === "assistant") {
+					early.messages = Array.isArray(early.messages) ? early.messages : [];
+					if (early.messages.length < 128) early.messages.push(ev);
+				}
 				this.earlyRuns.set(id, early);
 			}
 			return;
@@ -807,17 +836,7 @@ export class MatrixBotBridge {
 			run.epoch === (this.epochs.get(run.key) || 0);
 		if (!isCurrent() || run.ended) return;
 		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
-			const content = ev.message.content;
-			run.accumulatedText =
-				ev.message.stopReason === "toolUse" ||
-				(Array.isArray(content) && content.some((part) => part.type === "toolCall"))
-					? ""
-					: typeof content === "string"
-						? content
-						: (content || [])
-								.filter((part) => typeof part === "string" || part.type === "text")
-								.map((part) => (typeof part === "string" ? part : part.text || ""))
-								.join("\n");
+			run.accumulatedText = appendResponseSegment(run.accumulatedText, assistantResponseText(ev.message));
 		}
 		if (ev.type === "run_end") {
 			run.ended = true;
