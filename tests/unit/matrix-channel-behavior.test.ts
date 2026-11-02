@@ -175,7 +175,7 @@ describe("Matrix channel behavior", () => {
 		expect(sent.at(-1).body).toBe("answer");
 	});
 	it.each(["image", "audio", "file", "video"])("downloads %s and passes real attachments to chat", async (type) => {
-		const { inbound, host } = setup();
+		const { inbound, host, sent } = setup();
 		await inbound("example", {
 			msgtype: `m.${type}`,
 			url: "mxc://matrix.test/media",
@@ -183,6 +183,7 @@ describe("Matrix channel behavior", () => {
 		});
 		expect(host.fs.writePath).toHaveBeenCalledWith(expect.stringContaining(".matrix-media"), Buffer.from([1, 2, 3]));
 		expect(host.chat.mock.calls[0][0].text).toBe("example");
+		expect(sent).toHaveLength(0);
 		const attachment = host.chat.mock.calls[0][0].attachments[0];
 		if (type === "image")
 			expect(attachment).toEqual({ path: "", imageData: "AQID", mimeType: "image/png", name: "example" });
