@@ -75,6 +75,33 @@ describe("plugin media delivery", () => {
 		).rejects.toThrow(/ambiguous/);
 		expect(owner.prompt).not.toHaveBeenCalled();
 	});
+	it("uses the durable session id to disambiguate reused conversation ids", async () => {
+		const { svc, owner } = fixture();
+		const targetConv = { id: "c1", cwd: process.cwd(), session: { sessionId: "sdk-session-target" } };
+		const targetOwner = {
+			getConversation: vi.fn((id: string) => (id === targetConv.id ? targetConv : undefined)),
+			readConversationForPlugins: vi.fn(() => ({ conversationId: targetConv.id })),
+			markPluginRun: vi.fn(() => targetConv.id),
+			prompt: vi.fn().mockResolvedValue(undefined),
+			setThinking: vi.fn(),
+		};
+		svc.clients = new Map<string, any>([
+			["browser-a", owner],
+			["browser-b", targetOwner],
+		]);
+
+		const receipt = await svc.chatFromPlugin("telegram", {
+			accountId: "peer",
+			text: "hi",
+			conversationId: "c1",
+			sessionId: "sdk-session-target",
+			strictConversationId: true,
+		});
+
+		expect(receipt.sessionId).toBe("sdk-session-target");
+		expect(targetOwner.prompt).toHaveBeenCalledWith("hi", undefined, false, targetConv);
+		expect(owner.prompt).not.toHaveBeenCalled();
+	});
 	it("rejects malformed media before creating or waking a session", async () => {
 		const { svc, owner } = fixture();
 		await expect(

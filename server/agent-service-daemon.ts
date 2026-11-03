@@ -1060,15 +1060,19 @@ export class AgentService {
 		const target = String(req?.conversationId ?? "").trim();
 		if (target) {
 			// Conversation ids are local to a client. Prefer this channel's own
-			// client; otherwise require an unambiguous target instead of guessing.
+			// client. The durable SDK session id disambiguates restored clients
+			// whose local counters reuse the same conversation id.
+			const targetSessionId = String(req?.sessionId ?? "").trim();
+			const matchesTarget = (conv: Conversation) =>
+				!targetSessionId || String(conv.session.sessionId ?? "") === targetSessionId;
 			const own = this.clients.get(clientId);
 			const ownConv = own?.getConversation(target);
 			const hits: { owner: ClientSession; conv: Conversation; ownerId: string }[] = [];
-			if (own && ownConv) hits.push({ owner: own, conv: ownConv, ownerId: clientId });
+			if (own && ownConv && matchesTarget(ownConv)) hits.push({ owner: own, conv: ownConv, ownerId: clientId });
 			else {
 				for (const [ownerId, owner] of this.clients) {
 					const conv = owner.getConversation(target);
-					if (conv) hits.push({ owner, conv, ownerId });
+					if (conv && matchesTarget(conv)) hits.push({ owner, conv, ownerId });
 				}
 			}
 			if (hits.length > 1) throw new Error("chatFromPlugin: ambiguous conversation id; rebind the channel");

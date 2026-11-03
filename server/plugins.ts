@@ -271,6 +271,9 @@ export interface PluginChatRequest {
 	/** 可选：绑定已有会话 ID（命中运行中对话时走 steer 语义投递，网页端实时
 	 *  可见；miss/已回收时回落无头伪客户端执行，不静默丢消息）。 */
 	conversationId?: string;
+	/** Durable SDK session id from host.conversations.ensure(); disambiguates
+	 *  local conversation ids reused by multiple restored clients. */
+	sessionId?: string;
 	/** Require `conversationId` to resolve exactly; do not fall back to the
 	 *  plugin pseudo-client when it is missing or busy. Transport gateways use
 	 *  this to prevent cross-channel context leaks. */
@@ -339,6 +342,8 @@ export interface PluginConversationEnsureRequest {
 export interface PluginConversationEnsureResult {
 	ok: boolean;
 	conversationId?: string;
+	/** Stable SDK session identity for later host.chat targeting. */
+	sessionId?: string;
 	sessionFile?: string;
 	error?: string;
 }
@@ -4279,6 +4284,8 @@ export class PluginManager {
 			if (cwd) passthrough.cwd = cwd.slice(0, 1024);
 			const conversationId = String(r.conversationId ?? "").trim();
 			if (conversationId) passthrough.conversationId = conversationId.slice(0, 128);
+			const sessionId = String(r.sessionId ?? "").trim();
+			if (sessionId) passthrough.sessionId = sessionId.slice(0, 256);
 			if (r.strictConversationId === true) passthrough.strictConversationId = true;
 			if (r.independent === true) passthrough.independent = true;
 			const model = String(r.model ?? "").trim();

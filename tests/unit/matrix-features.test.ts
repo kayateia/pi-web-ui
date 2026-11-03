@@ -200,6 +200,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 		const ensureSpy = vi.fn().mockResolvedValue({
 			ok: true,
 			conversationId: "conv_matrix_profile",
+			sessionId: "session_matrix_profile",
 			sessionFile: "/sessions/matrix-profile.jsonl",
 		});
 		const chatSpy = vi.fn().mockResolvedValue({
@@ -242,6 +243,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 		expect(chatSpy).toHaveBeenCalledWith(
 			expect.objectContaining({
 				conversationId: "conv_matrix_profile",
+				sessionId: "session_matrix_profile",
 				strictConversationId: true,
 			}),
 		);

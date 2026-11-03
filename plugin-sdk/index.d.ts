@@ -184,6 +184,8 @@ export interface PluginConversationEnsureRequest {
 export interface PluginConversationEnsureResult {
 	ok: boolean;
 	conversationId?: string;
+	/** Stable SDK session identity for later host.chat targeting. */
+	sessionId?: string;
 	sessionFile?: string;
 	error?: string;
 }
@@ -215,6 +217,8 @@ export interface PluginChatRequest {
 	text: string;
 	accountId?: string;
 	conversationId?: string;
+	/** Durable SDK session id used to disambiguate local conversation ids. */
+	sessionId?: string;
 	strictConversationId?: boolean;
 	cwd?: string;
 	model?: string;

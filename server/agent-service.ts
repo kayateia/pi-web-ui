@@ -5631,6 +5631,7 @@ export class ClientSession {
 				return {
 					ok: true,
 					conversationId: existingConv.id,
+					sessionId: existingConv.session.sessionId,
 					...(existingConv.session.sessionFile ? { sessionFile: existingConv.session.sessionFile } : {}),
 				};
 			}
@@ -5662,6 +5663,7 @@ export class ClientSession {
 					return {
 						ok: true,
 						conversationId: openedHere.id,
+						sessionId: openedHere.session.sessionId,
 						sessionFile: openedHere.session.sessionFile,
 					};
 				}
@@ -5748,6 +5750,7 @@ export class ClientSession {
 			return {
 				ok: true,
 				conversationId: conv.id,
+				sessionId: conv.session.sessionId,
 				...(conv.session.sessionFile ? { sessionFile: conv.session.sessionFile } : {}),
 			};
 		} catch (err) {
