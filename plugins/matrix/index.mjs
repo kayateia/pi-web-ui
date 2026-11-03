@@ -524,6 +524,7 @@ export class MatrixBotBridge {
 			...sessionMap,
 			[storageKey]: {
 				conversationId: result.conversationId,
+				...(result.sessionId ? { sessionId: result.sessionId } : {}),
 				...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
 				updatedAt: Date.now(),
 			},
@@ -532,7 +533,11 @@ export class MatrixBotBridge {
 		await this.setSessionMap(next).catch((error) => {
 			this.log("warn", `Matrix conversation map persistence failed: ${error.message}`);
 		});
-		return { conversationId: result.conversationId, managed: true };
+		return {
+			conversationId: result.conversationId,
+			...(result.sessionId || saved.sessionId ? { sessionId: result.sessionId || saved.sessionId } : {}),
+			managed: true,
+		};
 	}
 
 	/** Queue one room message before processing it.
@@ -691,6 +696,7 @@ export class MatrixBotBridge {
 					...(attachments.length ? { attachments } : {}),
 					accountId: peerAccountId(`${key}:${this.epochs.get(key) || 0}`),
 					conversationId,
+					...(conversation.sessionId ? { sessionId: conversation.sessionId } : {}),
 					...(conversation.managed ? { strictConversationId: true } : {}),
 					...(workspace ? { cwd: workspace } : {}),
 					...(conversation.managed

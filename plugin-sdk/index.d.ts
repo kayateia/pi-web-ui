@@ -351,6 +351,7 @@ export interface PluginHost {
 	/** 无头调用：把外部通道文本投给 agent（要 "chat" 能力；宿主未接 chatProvider
 	 *  时 reject（由 chatWait 包成 {ok:false}，插件侧用 chatWait 更省心）。 */
 	chat(req: PluginChatRequest): Promise<{
+		/** Present only on mock hosts or older integrations; real failures reject. */
 		ok?: boolean;
 		conversationId: string;
 		clientId: string;

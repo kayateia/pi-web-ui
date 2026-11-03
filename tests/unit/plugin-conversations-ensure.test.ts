@@ -52,7 +52,12 @@ describe("host.conversations.ensure", () => {
 		mgr.conversationEnsurer = async (pluginId, request) => {
 			gotPlugin = pluginId;
 			gotRequest = request;
-			return { ok: true, conversationId: "c7", sessionFile: "/sessions/signal.jsonl" };
+			return {
+				ok: true,
+				conversationId: "c7",
+				sessionId: "sdk-session-signal",
+				sessionFile: "/sessions/signal.jsonl",
+			};
 		};
 
 		const result = await (
@@ -74,6 +79,7 @@ describe("host.conversations.ensure", () => {
 		expect(result).toEqual({
 			ok: true,
 			conversationId: "c7",
+			sessionId: "sdk-session-signal",
 			sessionFile: "/sessions/signal.jsonl",
 		});
 		expect(gotPlugin).toBe("signal");
