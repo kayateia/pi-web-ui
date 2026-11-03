@@ -24,15 +24,9 @@ export function stripInternalMarkers(text) {
 		.trim();
 }
 
-/** Extract display text from a completed assistant message, excluding tool preambles. */
+/** Extract text blocks from a completed assistant message, ignoring thinking and tool payloads. */
 function assistantResponseText(message) {
 	const content = message?.content;
-	if (
-		message?.stopReason === "toolUse" ||
-		(Array.isArray(content) && content.some((part) => ["toolCall", "tool_use", "function_call"].includes(part?.type)))
-	) {
-		return "";
-	}
 	const text =
 		typeof content === "string"
 			? content
