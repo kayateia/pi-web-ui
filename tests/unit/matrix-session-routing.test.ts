@@ -111,38 +111,38 @@ describe("Matrix persistent session routing", () => {
 		await restored.bridge.stop();
 	});
 
-	it("concatenates every completed assistant message around tool calls", async () => {
+	it("keeps text blocks from assistant messages that also contain tool calls", async () => {
 		const ctx = setup();
 		await ctx.send("room");
 		const receipt = await ctx.host.chat.mock.results[0].value;
 		ctx.bridge.feedback.mockClear();
-		const toolEvent = {
+
+		await ctx.bridge.handleRunEvent({
 			...receipt,
 			type: "message",
 			message: {
 				role: "assistant",
 				stopReason: "toolUse",
-				content: [{ type: "text", text: "tool preamble" }, { type: "toolCall" }],
+				content: [
+					{ type: "thinking", thinking: "Inspect first" },
+					{ type: "text", text: "First response" },
+					{ type: "toolCall" },
+				],
 			},
-		};
-
-		await ctx.event(receipt, "message", "First response");
-		await ctx.bridge.handleRunEvent(toolEvent);
+		});
 		await ctx.event(receipt, "message", "Second response");
-		await ctx.bridge.handleRunEvent(toolEvent);
-		await ctx.event(receipt, "message", "Third response");
 		await ctx.event(receipt, "run_end");
 
 		expect(ctx.bridge.feedback).toHaveBeenCalledTimes(1);
 		expect(ctx.bridge.feedback).toHaveBeenCalledWith(
 			"room",
-			"First response\n\n--\n\nSecond response\n\n--\n\nThird response",
+			"First response\n\n--\n\nSecond response",
 			"thread",
 			expect.any(Function),
 		);
 	});
 
-	it("does not borrow a session for an unknown rid or bare c1, and ignores tool preambles", async () => {
+	it("does not borrow a session for an unknown rid or bare c1, and keeps tool-call text", async () => {
 		const ctx = setup();
 		await ctx.send("room");
 		const receipt = await finishInbound(ctx);
@@ -163,7 +163,7 @@ describe("Matrix persistent session routing", () => {
 			},
 		});
 		await ctx.event(web, "run_end");
-		expect(ctx.bridge.feedback.mock.calls[0][1]).toBe("preamble");
+		expect(ctx.bridge.feedback.mock.calls[0][1]).toBe("preamble\n\n--\n\ntool preamble");
 	});
 
 	it.each(["account", "stop"])("stops remaining chunks after %s changes during delivery", async (change) => {
