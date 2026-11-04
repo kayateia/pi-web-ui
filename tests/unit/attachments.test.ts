@@ -165,6 +165,29 @@ describe("buildAttachmentMessages — 编辑重问附件恢复", () => {
 		}
 	});
 
+	it("keeps validated inline images above 2 MiB instead of silently dropping them", async () => {
+		const dataDir = tempDir();
+		const notices: { level: string; text: string }[] = [];
+		const ctx = makeCtx({ dataDir, cwd: tempDir(), notices });
+		ctx.settings.visionBridgeEnabled = false;
+		const imageData = Buffer.alloc(3 * 1024 * 1024, 1).toString("base64");
+
+		const out = (await buildAttachmentMessages(ctx, [
+			{
+				path: "",
+				imageData,
+				mimeType: "image/png",
+				name: "large-photo.png",
+				size: Buffer.byteLength(imageData, "base64"),
+			},
+		])) as Aside[];
+
+		expect(out).toHaveLength(1);
+		expect(out[0].message.content[0]).toMatchObject({ type: "image", data: imageData });
+		expect(out[0].message.details).toMatchObject({ name: "large-photo.png", mode: "image" });
+		expect(notices.some((notice) => notice.text.includes("过大"))).toBe(false);
+	});
+
 	it("恢复的 uploadPath 从 uploads 目录重读字节、按同路径附加", async () => {
 		const dataDir = tempDir();
 		const oldDataDir = process.env.PI_WEB_DATA_DIR;
