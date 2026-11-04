@@ -200,7 +200,7 @@ export async function buildAttachmentMessages(
 			const mimeType = att.mimeType?.startsWith("image/") ? att.mimeType : "image/png";
 			const bytes = Buffer.byteLength(raw, "base64");
 			// Only images that would actually be sent (non-empty, under the cap).
-			if (bytes > 0 && bytes <= 2 * 1024 * 1024) {
+			if (bytes > 0 && bytes <= 10 * 1024 * 1024) {
 				if (!mainSupportsVision) {
 					bridgedImages.push({ idx, att, raw, mimeType, bytes });
 				}
@@ -471,13 +471,14 @@ The user referenced this canvas. First use canvas(action="get", graphId="${attr(
 			continue;
 		}
 
-		// Raw pasted/dropped/uploaded image — no workspace path involved (the
-		// browser downscales client-side; this guard only prevents abuse).
+		// Raw pasted/dropped/uploaded image — no workspace path involved. The
+		// browser normally downscales, while transport plugins validate up to
+		// 10 MiB before calling host.chat(), so this guard matches that contract.
 		if (att.imageData) {
 			const raw = att.imageData.replace(/^data:[^;]*;base64,/, "");
 			const mimeType = att.mimeType?.startsWith("image/") ? att.mimeType : "image/png";
 			const bytes = Buffer.byteLength(raw, "base64");
-			const MAX_PASTED_IMAGE_BYTES = 2 * 1024 * 1024;
+			const MAX_PASTED_IMAGE_BYTES = 10 * 1024 * 1024;
 			if (bytes === 0) {
 				ctx.emit({
 					type: "notice",
