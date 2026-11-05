@@ -1700,7 +1700,7 @@ function closeCameraPanel() {
 
 /**
  * 把一帧画到 canvas 再编码 JPEG：先按最长边压到 1568，仍超 2MB 就逐档降尺寸。
- * 2MB 是服务端粘贴图片的硬上限（agent-service 的 MAX_PASTED_IMAGE_BYTES），超了会被拒。
+ * 2MB 是浏览器图片输入的压缩目标，服务端对已验证的通道插件允许更大的图片。
  */
 function frameToJpegBase64(source, srcW, srcH) {
 	if (!srcW || !srcH) throw new Error(isZh ? "取不到画面尺寸，请稍后再拍" : "No frame size yet, try again");

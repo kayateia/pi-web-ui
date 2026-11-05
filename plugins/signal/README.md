@@ -7,6 +7,10 @@ signal-cli's `getAttachment` RPC and forwarded as normal pi-web-ui image content
 Signal `@mentions` are resolved against known contacts and rendered as readable
 `@Display Name` text in the conversation.
 
+Channel runs are claimed by the host's stable `runId`, so replies survive
+conversation takeover and local ID changes. Bound conversations also carry their
+durable SDK `sessionId` to avoid ambiguous IDs after a restart.
+
 ## Requirements
 
 - linked signal-cli account with `signal-cli daemon --http 127.0.0.1:8080`
@@ -16,6 +20,14 @@ By default the plugin owns the daemon lifecycle: enabling the gateway starts
 `signal-cli -a <account> daemon --http <loopback-url>`, and disabling the
 gateway or unloading the plugin terminates that child process. Select
 **External / systemd** instead when another supervisor already owns the daemon.
+Owned daemon failures are retried with bounded exponential backoff. Runtime
+stdout/stderr is retained only in a small in-memory tail and is attached to
+startup/crash errors for diagnosis.
+
+The receive SSE stream has a two-minute inactivity watchdog. If signal-cli
+leaves the HTTP connection open but stops streaming events, the gateway closes
+it and reconnects using exponential backoff. Reconnect counts and the last SSE
+data timestamp are exposed in the status response.
 
 The account setup and systemd daemon used by the existing pi-signal integration
 are documented at <https://github.com/aalzubidy/pi-signal>.

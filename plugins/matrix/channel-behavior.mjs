@@ -3,8 +3,9 @@ import { isAbsolute, resolve, relative, sep, basename } from "node:path";
 
 export const MEDIA_LIMIT = 25 * 1024 * 1024;
 export const mediaTypes = { "m.image": "image", "m.audio": "audio", "m.file": "file", "m.video": "video" };
-export function scopeKey(roomId, sender, threadId = "") {
-	return JSON.stringify([roomId, threadId, sender]);
+/** Identity one Matrix room as one pi-web-ui channel across users and threads. */
+export function channelKey(roomId) {
+	return JSON.stringify([roomId]);
 }
 export function threadOf(content) {
 	const relation = content?.["m.relates_to"];

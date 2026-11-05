@@ -184,6 +184,8 @@ export interface PluginConversationEnsureRequest {
 export interface PluginConversationEnsureResult {
 	ok: boolean;
 	conversationId?: string;
+	/** Stable SDK session identity for later host.chat targeting. */
+	sessionId?: string;
 	sessionFile?: string;
 	error?: string;
 }
@@ -202,7 +204,7 @@ export type ToolGuardPreDecision =
 	| { decision: "ask"; reason?: string; reasonEn?: string };
 
 export interface PluginChatAttachment {
-	path: string;
+	path?: string;
 	mode?: "reference" | "inline";
 	name?: string;
 	mimeType?: string;
@@ -215,6 +217,8 @@ export interface PluginChatRequest {
 	text: string;
 	accountId?: string;
 	conversationId?: string;
+	/** Durable SDK session id used to disambiguate local conversation ids. */
+	sessionId?: string;
 	strictConversationId?: boolean;
 	cwd?: string;
 	model?: string;
@@ -389,6 +393,7 @@ export interface PluginHost {
 		ok?: boolean;
 		conversationId: string;
 		clientId: string;
+		sessionId?: string;
 		runId?: string;
 	}>;
 	/** 等待无头调用的运行结束（默认 120s 超时；无注入/超时/失败一律回 {ok:false}，绝不抛错）。 */

@@ -260,7 +260,7 @@ export interface PluginChatRequest {
 	/** Whether newly created channel conversations require ownership transfer to open. Defaults to false. */
 	independent?: boolean;
 	/** Image bytes or file references, validated before delivery (8 items, 10 MiB each, 20 MiB total). */
-	attachments?: PromptAttachment[];
+	attachments?: PluginChatAttachment[];
 	/** 送给 agent 的任务文本（插件应已拼好发送者前缀、裁剪封顶）。 */
 	text: string;
 	/** 通道内的账号标识（多账号隔离：每个 accountId 独立伪客户端/会话）。 */
@@ -271,6 +271,9 @@ export interface PluginChatRequest {
 	/** 可选：绑定已有会话 ID（命中运行中对话时走 steer 语义投递，网页端实时
 	 *  可见；miss/已回收时回落无头伪客户端执行，不静默丢消息）。 */
 	conversationId?: string;
+	/** Durable SDK session id from host.conversations.ensure(); disambiguates
+	 *  local conversation ids reused by multiple restored clients. */
+	sessionId?: string;
 	/** Require `conversationId` to resolve exactly; do not fall back to the
 	 *  plugin pseudo-client when it is missing or busy. Transport gateways use
 	 *  this to prevent cross-channel context leaks. */
@@ -280,6 +283,9 @@ export interface PluginChatRequest {
 	/** 可选：指定思考强度（投递前切换，失败即拒绝不回落）。 */
 	thinkingLevel?: string;
 }
+
+/** Backward-compatible attachment shape used by existing channel callers. */
+export type PluginChatAttachment = Omit<PromptAttachment, "path"> & { path?: string };
 
 /** host.chat 的投递回执（运行中，结论经 run_end 事件）。 */
 export interface PluginChatResult {
@@ -339,6 +345,8 @@ export interface PluginConversationEnsureRequest {
 export interface PluginConversationEnsureResult {
 	ok: boolean;
 	conversationId?: string;
+	/** Stable SDK session identity for later host.chat targeting. */
+	sessionId?: string;
 	sessionFile?: string;
 	error?: string;
 }
@@ -4279,12 +4287,15 @@ export class PluginManager {
 			if (cwd) passthrough.cwd = cwd.slice(0, 1024);
 			const conversationId = String(r.conversationId ?? "").trim();
 			if (conversationId) passthrough.conversationId = conversationId.slice(0, 128);
+			const sessionId = String(r.sessionId ?? "").trim();
+			if (sessionId) passthrough.sessionId = sessionId.slice(0, 256);
 			if (r.strictConversationId === true) passthrough.strictConversationId = true;
 			if (r.independent === true) passthrough.independent = true;
 			const model = String(r.model ?? "").trim();
 			if (model) passthrough.model = model.slice(0, 256);
 			const thinkingLevel = String(r.thinkingLevel ?? "").trim();
 			if (thinkingLevel) passthrough.thinkingLevel = thinkingLevel.slice(0, 64);
+			if (attachments?.length) passthrough.attachments = attachments;
 			return self.chatProvider(info.id, passthrough);
 		};
 		let pluginAbort: AbortController | null = null;

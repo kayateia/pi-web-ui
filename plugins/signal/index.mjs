@@ -14,6 +14,10 @@ import { spawn } from "node:child_process";
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:8080";
 const SSE_RETRY_INITIAL_MS = 2_000;
 const SSE_RETRY_MAX_MS = 60_000;
+const SSE_IDLE_TIMEOUT_MS = 2 * 60_000;
+const DAEMON_RESTART_INITIAL_MS = 1_000;
+const DAEMON_RESTART_MAX_MS = 30_000;
+const DAEMON_LOG_TAIL_CHARS = 4_096;
 const SIGNAL_CHUNK_CHARS = 7_800;
 const MAX_SEEN_ENVELOPES = 2_000;
 const RUN_TIMEOUT_MS = 20 * 60_000;
@@ -457,7 +461,15 @@ export class SignalGateway {
 		this.accountUuid = "";
 		this.daemonUrl = DEFAULT_DAEMON_URL;
 		this.sseRequest = null;
+		this.sseWatchdog = null;
+		this.sseGeneration = 0;
+		this.sseReconnects = 0;
+		this.lastSseDataAt = null;
 		this.daemonChild = null;
+		this.daemonRestartTimer = null;
+		this.daemonRestartDelay = DAEMON_RESTART_INITIAL_MS;
+		this.daemonRestartAttempts = 0;
+		this.daemonLogTail = "";
 		this.stoppingDaemon = false;
 		this.reconnectTimer = null;
 		this.reconnectDelay = SSE_RETRY_INITIAL_MS;
@@ -493,6 +505,10 @@ export class SignalGateway {
 			daemonUrl: this.daemonUrl,
 			daemonMode: config.daemonMode || "managed",
 			daemonManaged: Boolean(this.daemonChild),
+			daemonPid: this.daemonChild?.pid ?? null,
+			daemonRestartAttempts: this.daemonRestartAttempts,
+			sseReconnects: this.sseReconnects,
+			lastSseDataAt: this.lastSseDataAt,
 			channelQueues: Object.fromEntries([...this.channelQueues].map(([key, queue]) => [key, queue.length])),
 			activeChannels: [...this.activeChannels],
 			channelSessions: { ...this.sessionMap },
@@ -515,20 +531,27 @@ export class SignalGateway {
 		this.status.state = "connecting";
 		this.status.account = account;
 		this.status.lastError = null;
-		if ((config.daemonMode || "managed") === "managed") {
-			try {
+		this.daemonRestartDelay = DAEMON_RESTART_INITIAL_MS;
+		this.daemonRestartAttempts = 0;
+		this.daemonLogTail = "";
+		try {
+			if ((config.daemonMode || "managed") === "managed") {
 				await this.startManagedDaemon();
-			} catch (error) {
-				this.running = false;
-				this.status.enabled = false;
-				this.status.state = "error";
-				this.status.connected = false;
-				this.status.lastError = formatSignalError(error);
-				await this.stopManagedDaemon().catch(() => {});
-				throw error;
 			}
+			this.accountUuid = await this.resolveAccountUuid(account);
+			if (!this.accountUuid) {
+				this.status.lastError =
+					"signal-cli is reachable, but the configured account was not present in listContacts; the SSE stream may remain silent.";
+			}
+		} catch (error) {
+			this.running = false;
+			this.status.enabled = false;
+			this.status.state = "error";
+			this.status.connected = false;
+			this.status.lastError = formatSignalError(error);
+			await this.stopManagedDaemon().catch(() => {});
+			throw error;
 		}
-		this.accountUuid = await this.resolveAccountUuid(account).catch(() => "");
 		this.status.accountUuid = this.accountUuid;
 
 		if (typeof this.host?.onRunEvent === "function") {
@@ -544,14 +567,19 @@ export class SignalGateway {
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
+		this.sseGeneration++;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = null;
+		if (this.sseWatchdog) clearTimeout(this.sseWatchdog);
+		this.sseWatchdog = null;
 		if (this.sseRequest) {
 			try {
 				this.sseRequest.destroy();
 			} catch {}
 		}
 		this.sseRequest = null;
+		if (this.daemonRestartTimer) clearTimeout(this.daemonRestartTimer);
+		this.daemonRestartTimer = null;
 		if (this.offRunEvent) {
 			try {
 				this.offRunEvent();
@@ -562,6 +590,8 @@ export class SignalGateway {
 			if (pending.timeout) clearTimeout(pending.timeout);
 		}
 		this.pendingRuns.clear();
+		this.channelQueues.clear();
+		this.activeChannels.clear();
 		await this.stopManagedDaemon();
 	}
 
@@ -595,13 +625,16 @@ export class SignalGateway {
 		}
 
 		this.stoppingDaemon = false;
+		this.daemonLogTail = "";
 		const child = this.spawnProcess(command.command, command.args, {
-			stdio: "ignore",
+			stdio: ["ignore", "pipe", "pipe"],
 			env: { ...process.env },
 			shell: false,
 			windowsHide: true,
 		});
 		this.daemonChild = child;
+		child.stdout?.on("data", (chunk) => this.appendDaemonLog(chunk));
+		child.stderr?.on("data", (chunk) => this.appendDaemonLog(chunk));
 		let launchError = null;
 		child.once("error", (error) => {
 			launchError = error;
@@ -609,21 +642,16 @@ export class SignalGateway {
 
 		const deadline = Date.now() + 60_000;
 		while (Date.now() < deadline) {
-			if (launchError) throw new Error(`Could not start signal-cli: ${formatSignalError(launchError)}`);
+			if (launchError)
+				throw new Error(`Could not start signal-cli: ${formatSignalError(launchError)}${this.daemonLogSuffix()}`);
 			if (child.exitCode !== null || child.signalCode !== null) {
 				throw new Error(
-					`signal-cli exited during startup (code ${child.exitCode ?? "none"}, signal ${child.signalCode ?? "none"})`,
+					`signal-cli exited during startup (code ${child.exitCode ?? "none"}, signal ${child.signalCode ?? "none"})${this.daemonLogSuffix()}`,
 				);
 			}
 			if (await this.daemonReachable()) {
 				child.once("exit", (code, signal) => {
-					if (this.daemonChild === child) this.daemonChild = null;
-					if (this.stoppingDaemon || !this.running) return;
-					this.connected = false;
-					this.status.connected = false;
-					this.status.state = "error";
-					this.status.lastError = `signal-cli daemon exited (code ${code ?? "none"}, signal ${signal ?? "none"})`;
-					this.log("warn", this.status.lastError);
+					this.handleManagedDaemonExit(child, code, signal);
 				});
 				return;
 			}
@@ -633,13 +661,65 @@ export class SignalGateway {
 			child.kill("SIGTERM");
 		} catch {}
 		if (this.daemonChild === child) this.daemonChild = null;
-		throw new Error("signal-cli daemon did not become ready within 60 seconds");
+		throw new Error(`signal-cli daemon did not become ready within 60 seconds${this.daemonLogSuffix()}`);
+	}
+
+	appendDaemonLog(chunk) {
+		const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk ?? "");
+		if (!text) return;
+		this.daemonLogTail = `${this.daemonLogTail}${text}`.slice(-DAEMON_LOG_TAIL_CHARS);
+	}
+
+	daemonLogSuffix() {
+		const tail = this.daemonLogTail.trim();
+		return tail ? `\n${tail}` : "";
+	}
+
+	handleManagedDaemonExit(child, code, signal) {
+		if (this.daemonChild !== child) return;
+		this.daemonChild = null;
+		this.connected = false;
+		this.status.connected = false;
+		if (this.stoppingDaemon || !this.running) return;
+		const reason = `signal-cli daemon exited (code ${code ?? "none"}, signal ${signal ?? "none"})${this.daemonLogSuffix()}`;
+		this.status.state = "starting";
+		this.status.lastError = reason;
+		this.log("warn", reason);
+		this.teardownSse();
+		if ((this.getConfig()?.daemonMode || "managed") === "managed") this.scheduleDaemonRestart(reason);
+		else this.status.state = "error";
+	}
+
+	scheduleDaemonRestart(reason) {
+		if (!this.running || this.stoppingDaemon || this.daemonRestartTimer) return;
+		const delay = this.daemonRestartDelay;
+		this.daemonRestartDelay = Math.min(this.daemonRestartDelay * 2, DAEMON_RESTART_MAX_MS);
+		this.daemonRestartAttempts++;
+		this.log("info", `Restarting managed signal-cli in ${delay}ms after: ${reason}`);
+		this.daemonRestartTimer = setTimeout(() => {
+			this.daemonRestartTimer = null;
+			if (!this.running || this.stoppingDaemon) return;
+			void this.startManagedDaemon()
+				.then(() => {
+					this.status.lastError = null;
+					this.daemonRestartDelay = DAEMON_RESTART_INITIAL_MS;
+					this.connectSse();
+				})
+				.catch((error) => {
+					const detail = formatSignalError(error);
+					this.status.lastError = detail;
+					this.scheduleDaemonRestart(detail);
+				});
+		}, delay);
+		this.daemonRestartTimer.unref?.();
 	}
 
 	/** Terminate only the child process owned by this gateway. */
 	async stopManagedDaemon() {
 		const child = this.daemonChild;
 		if (!child) return;
+		if (this.daemonRestartTimer) clearTimeout(this.daemonRestartTimer);
+		this.daemonRestartTimer = null;
 		this.stoppingDaemon = true;
 		const exited = new Promise((resolve) => child.once("exit", resolve));
 		try {
@@ -654,6 +734,8 @@ export class SignalGateway {
 		}
 		if (this.daemonChild === child) this.daemonChild = null;
 		this.stoppingDaemon = false;
+		this.daemonRestartDelay = DAEMON_RESTART_INITIAL_MS;
+		this.daemonLogTail = "";
 	}
 
 	/** Load and cache contact labels used to render Signal @mentions. */
@@ -697,14 +779,38 @@ export class SignalGateway {
 		});
 	}
 
-	connectSse() {
-		if (!this.running) return;
+	teardownSse() {
+		if (this.sseWatchdog) clearTimeout(this.sseWatchdog);
+		this.sseWatchdog = null;
 		if (this.sseRequest) {
 			try {
 				this.sseRequest.destroy();
 			} catch {}
-			this.sseRequest = null;
 		}
+		this.sseRequest = null;
+		this.sseGeneration++;
+		this.connected = false;
+		this.status.connected = false;
+	}
+
+	touchSse(generation) {
+		if (!this.running || generation !== this.sseGeneration) return;
+		this.lastSseDataAt = Date.now();
+		if (this.sseWatchdog) clearTimeout(this.sseWatchdog);
+		this.sseWatchdog = setTimeout(() => {
+			this.sseWatchdog = null;
+			if (!this.running || generation !== this.sseGeneration || !this.connected) return;
+			this.scheduleReconnect(`Signal SSE received no data for ${Math.round(SSE_IDLE_TIMEOUT_MS / 1000)} seconds`);
+		}, SSE_IDLE_TIMEOUT_MS);
+		this.sseWatchdog.unref?.();
+	}
+
+	connectSse() {
+		if (!this.running) return;
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = null;
+		this.teardownSse();
+		const generation = this.sseGeneration;
 		const account = this.status.account;
 		const url = new URL(this.daemonUrl);
 		const path = `/api/v1/events?account=${encodeURIComponent(account)}`;
@@ -718,6 +824,10 @@ export class SignalGateway {
 				timeout: 0,
 			},
 			(response) => {
+				if (!this.running || generation !== this.sseGeneration) {
+					response.resume();
+					return;
+				}
 				if (response.statusCode !== 200) {
 					response.resume();
 					this.scheduleReconnect(`SSE HTTP ${response.statusCode}`);
@@ -726,9 +836,14 @@ export class SignalGateway {
 				this.connected = true;
 				this.status.connected = true;
 				this.status.state = "connected";
+				this.status.lastError = null;
 				this.reconnectDelay = SSE_RETRY_INITIAL_MS;
+				this.touchSse(generation);
+				this.log("info", "Signal SSE connected");
 				let buffer = "";
 				response.on("data", (chunk) => {
+					if (!this.running || generation !== this.sseGeneration) return;
+					this.touchSse(generation);
 					buffer += chunk.toString("utf8");
 					const lines = buffer.split("\n");
 					buffer = lines.pop() || "";
@@ -747,27 +862,35 @@ export class SignalGateway {
 						if (parsed) void this.onInbound(parsed);
 					}
 				});
-				response.on("end", () => this.scheduleReconnect("SSE stream ended"));
-				response.on("error", (error) => this.scheduleReconnect(error.message));
+				response.on("end", () => {
+					if (generation === this.sseGeneration) this.scheduleReconnect("SSE stream ended");
+				});
+				response.on("error", (error) => {
+					if (generation === this.sseGeneration) this.scheduleReconnect(error.message);
+				});
 			},
 		);
-		request.on("error", (error) => this.scheduleReconnect(error.message));
+		request.on("error", (error) => {
+			if (generation === this.sseGeneration) this.scheduleReconnect(error.message);
+		});
 		request.setTimeout(0);
 		this.sseRequest = request;
 	}
 
 	scheduleReconnect(reason) {
-		this.connected = false;
-		this.status.connected = false;
 		if (!this.running || this.reconnectTimer) return;
+		this.teardownSse();
 		this.status.state = "connecting";
 		this.status.lastError = reason;
+		this.log("warn", `Signal SSE reconnect: ${reason}`);
 		const delay = this.reconnectDelay;
 		this.reconnectDelay = Math.min(this.reconnectDelay * 2, SSE_RETRY_MAX_MS);
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;
+			this.sseReconnects++;
 			this.connectSse();
 		}, delay);
+		this.reconnectTimer.unref?.();
 	}
 
 	seenEnvelope(parsed) {
@@ -868,6 +991,7 @@ export class SignalGateway {
 		this.sessionMap[parsed.key] = {
 			generation,
 			conversationId: result.conversationId,
+			...(result.sessionId ? { sessionId: result.sessionId } : {}),
 			...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
 			updatedAt: Date.now(),
 		};
@@ -978,11 +1102,11 @@ export class SignalGateway {
 				text: promptText,
 				accountId: senderAccountId(parsed.sender.channelIds[0] || parsed.key),
 				conversationId,
+				...(binding.sessionId ? { sessionId: binding.sessionId } : {}),
 				strictConversationId: true,
 				...(images.length > 0
 					? {
 							attachments: images.map(({ name, mimeType, imageData }) => ({
-								path: "",
 								name,
 								mimeType,
 								imageData,
@@ -996,10 +1120,10 @@ export class SignalGateway {
 			if (!result?.conversationId) throw new Error("Signal prompt 未被 pi-web-ui 接收");
 			if (result.runId) this.bindPendingRun(pending, result.runId);
 			if (result.sessionId) {
-				const binding = this.sessionMap[parsed.key];
-				if (binding) {
-					binding.sessionId = result.sessionId;
-					binding.conversationId = result.conversationId;
+				const saved = this.sessionMap[parsed.key];
+				if (saved) {
+					saved.sessionId = result.sessionId;
+					saved.conversationId = result.conversationId;
 					await this.setSessionMap(this.sessionMap);
 				}
 			}
@@ -1013,32 +1137,33 @@ export class SignalGateway {
 		}
 	}
 
-	bindPendingRun(pending, runId) {
-		const previous = pending.runId;
-		pending.runId = runId;
-		if (previous && this.pendingRuns.get(previous) === pending) this.pendingRuns.delete(previous);
-		if (this.pendingRuns.get(pending.conversationId) === pending) {
-			this.pendingRuns.delete(pending.conversationId);
-		}
-		this.pendingRuns.set(runId, pending);
+	deletePendingRun(pending) {
+		for (const [key, value] of this.pendingRuns) if (value === pending) this.pendingRuns.delete(key);
 	}
 
-	deletePendingRun(pending) {
-		for (const [key, value] of this.pendingRuns) {
-			if (value === pending) this.pendingRuns.delete(key);
-		}
+	bindPendingRun(pending, runId) {
+		if (![...this.pendingRuns.values()].includes(pending)) return;
+		pending.runId = runId;
+		this.pendingRuns.delete(pending.conversationId);
+		this.pendingRuns.set(`run:${runId}`, pending);
+	}
+
+	pendingRunFor(event) {
+		const runId = String(event?.runId ?? "");
+		const conversationId = String(event?.conversationId ?? "");
+		return (
+			(runId ? this.pendingRuns.get(`run:${runId}`) : undefined) ||
+			(conversationId ? this.pendingRuns.get(conversationId) : undefined)
+		);
 	}
 
 	handleRunEvent(event) {
-		const conversationId = String(event?.conversationId ?? "");
-		const runId = String(event?.runId ?? "");
-		let pending = runId ? this.pendingRuns.get(runId) : undefined;
-		if (!pending && conversationId) pending = this.pendingRuns.get(conversationId);
+		const pending = this.pendingRunFor(event);
 		if (!pending) return;
-		if (runId && pending.runId !== runId) this.bindPendingRun(pending, runId);
 
 		if (event.type === "run_start") {
-			if (event.task && event.task !== pending.expectedTask) {
+			const stableMatch = Boolean(event.runId && pending.runId && event.runId === pending.runId);
+			if (!stableMatch && event.task && event.task !== String(pending.expectedTask).slice(0, 500)) {
 				if (pending.timeout) clearTimeout(pending.timeout);
 				this.deletePendingRun(pending);
 			}

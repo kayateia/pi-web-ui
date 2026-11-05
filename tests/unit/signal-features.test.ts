@@ -324,6 +324,23 @@ describe("Signal delivery helpers", () => {
 		expect(chunks.join("\n\n")).toBe(text);
 	});
 
+	it("reconnects an SSE stream that stays open but goes silent", () => {
+		vi.useFakeTimers();
+		try {
+			const gateway = new SignalGateway({ host: {}, getConfig: () => normalizeConfig({}) });
+			gateway.running = true;
+			gateway.connected = true;
+			gateway.status.connected = true;
+			gateway.sseGeneration = 4;
+			const reconnect = vi.spyOn(gateway, "scheduleReconnect").mockImplementation(() => {});
+			gateway.touchSse(4);
+			vi.advanceTimersByTime(2 * 60_000);
+			expect(reconnect).toHaveBeenCalledWith(expect.stringContaining("received no data"));
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("downloads Signal image attachments through getAttachment", async () => {
 		const raw = directEnvelope("");
 		raw.envelope.dataMessage.attachments = [
@@ -386,23 +403,98 @@ describe("Signal delivery helpers", () => {
 		gateway.unreact = async () => {};
 		gateway.pendingRuns.set("c1", {
 			conversationId: "c1",
-			runId: "",
 			parsed,
 			expectedTask: "hello",
 			text: "",
 			timeout: null,
 		});
-		gateway.handleRunEvent({ type: "run_start", conversationId: "c1", runId: "pr-1", task: "hello" });
+		gateway.handleRunEvent({ type: "run_start", conversationId: "c1", task: "hello" });
 		gateway.handleRunEvent({
 			type: "message",
 			conversationId: "c1",
-			runId: "pr-1",
 			message: { role: "assistant", content: "reply" },
 		});
-		gateway.handleRunEvent({ type: "run_end", conversationId: "c1", runId: "pr-1" });
+		gateway.handleRunEvent({ type: "run_end", conversationId: "c1" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(sent).toEqual(["reply"]);
+		expect(gateway.pendingRuns.has("c1")).toBe(false);
+	});
+
+	it("claims takeover-safe events by stable runId instead of local conversation id", async () => {
+		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
+		const gateway = new SignalGateway({
+			host: {},
+			getConfig: () => normalizeConfig({ allowedSenders: [`aci:${aliceUuid}`] }),
+		});
+		gateway.status.account = account;
+		const sent: string[] = [];
+		gateway.sendText = async (_channel, text) => {
+			sent.push(text);
+		};
+		gateway.react = async () => {};
+		gateway.unreact = async () => {};
+		const pending = {
+			conversationId: "c1",
+			runId: "",
+			parsed,
+			expectedTask: "hello",
+			text: "",
+			timeout: null,
+		};
+		gateway.pendingRuns.set("c1", pending);
+		gateway.bindPendingRun(pending, "pr-stable");
+		expect(gateway.pendingRuns.has("c1")).toBe(false);
+		expect(gateway.pendingRuns.has("run:pr-stable")).toBe(true);
+
+		gateway.handleRunEvent({ type: "run_start", conversationId: "renamed", runId: "pr-stable", task: "hello" });
+		gateway.handleRunEvent({
+			type: "message",
+			conversationId: "renamed-again",
+			runId: "pr-stable",
+			message: { role: "assistant", content: "reply" },
+		});
+		gateway.handleRunEvent({ type: "run_end", conversationId: "final-id", runId: "pr-stable" });
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(sent).toEqual(["reply"]);
 		expect(gateway.pendingRuns.size).toBe(0);
+	});
+
+	it("accepts the host's 500-character run-start task truncation for a stable run", async () => {
+		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
+		const gateway = new SignalGateway({ host: {}, getConfig: () => normalizeConfig({}) });
+		const sent: string[] = [];
+		gateway.sendText = async (_channel, text) => {
+			sent.push(text);
+		};
+		gateway.react = async () => {};
+		gateway.unreact = async () => {};
+		const expectedTask = `[Signal DM]: ${"x".repeat(600)}`;
+		const pending = {
+			conversationId: "c1",
+			runId: "",
+			parsed,
+			expectedTask,
+			text: "",
+			timeout: null,
+		};
+		gateway.pendingRuns.set("c1", pending);
+		gateway.bindPendingRun(pending, "pr-long");
+
+		gateway.handleRunEvent({
+			type: "run_start",
+			conversationId: "c1",
+			runId: "pr-long",
+			task: expectedTask.slice(0, 500),
+		});
+		gateway.handleRunEvent({
+			type: "message",
+			conversationId: "c1",
+			runId: "pr-long",
+			message: { role: "assistant", content: "reply" },
+		});
+		gateway.handleRunEvent({ type: "run_end", conversationId: "c1", runId: "pr-long" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(sent).toEqual(["reply"]);
 	});
 
 	it("passes the composed global + channel prompt as an append layer", async () => {
@@ -461,7 +553,7 @@ describe("Signal delivery helpers", () => {
 		const gateway = new SignalGateway({
 			host: {
 				conversations: {
-					ensure: async () => ({ ok: true, conversationId: "c1" }),
+					ensure: async () => ({ ok: true, conversationId: "c1", sessionId: "sdk-signal-session" }),
 				},
 				chat: async (request: Record<string, unknown>) => {
 					chatRequest = request;
@@ -488,10 +580,10 @@ describe("Signal delivery helpers", () => {
 		gateway.pendingRuns.clear();
 		expect(chatRequest).toMatchObject({
 			conversationId: "c1",
+			sessionId: "sdk-signal-session",
 			strictConversationId: true,
 			attachments: [
 				{
-					path: "",
 					name: "photo.png",
 					mimeType: "image/png",
 					imageData: "UE5HIQ==",
@@ -581,6 +673,68 @@ describe("managed signal-cli lifecycle", () => {
 			state: "idle",
 		});
 		fetchSpy.mockRestore();
+	});
+
+	it("restarts an owned daemon after an unexpected exit with backoff", async () => {
+		vi.useFakeTimers();
+		try {
+			const gateway = new SignalGateway({
+				host: {},
+				getConfig: () =>
+					normalizeConfig({
+						enabled: true,
+						account,
+						daemonMode: "managed",
+					}),
+			});
+			gateway.running = true;
+			const child = { pid: 4242 };
+			gateway.daemonChild = child;
+			const start = vi.spyOn(gateway, "startManagedDaemon").mockResolvedValue(undefined);
+			const connect = vi.spyOn(gateway, "connectSse").mockImplementation(() => {});
+
+			gateway.handleManagedDaemonExit(child, 1, null);
+			expect(gateway.status.state).toBe("starting");
+			expect(gateway.daemonRestartAttempts).toBe(1);
+			expect(gateway.daemonChild).toBe(null);
+			expect(start).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(connect).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("fails startup visibly when signal-cli cannot serve the configured account", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(JSON.stringify({ jsonrpc: "2.0", error: { message: "NotRegisteredException" } }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		try {
+			const gateway = new SignalGateway({
+				host: {},
+				getConfig: () =>
+					normalizeConfig({
+						enabled: true,
+						account,
+						daemonMode: "external",
+					}),
+			});
+			const connect = vi.spyOn(gateway, "connectSse").mockImplementation(() => {});
+			await expect(gateway.start()).rejects.toThrow(/NotRegisteredException/);
+			expect(connect).not.toHaveBeenCalled();
+			expect(gateway.getStatus()).toMatchObject({
+				enabled: false,
+				connected: false,
+				state: "error",
+			});
+		} finally {
+			fetchSpy.mockRestore();
+		}
 	});
 });
 

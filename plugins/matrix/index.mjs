@@ -9,7 +9,8 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
-import { scopeKey, threadOf, mediaTypes, receiveMedia, sendMedia } from "./channel-behavior.mjs";
+import { channelKey, threadOf, mediaTypes, receiveMedia, sendMedia } from "./channel-behavior.mjs";
+import { matrixChatError, matrixChatText, normalizeMatrixLocale } from "./chat-i18n.mjs";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 
 export const SECRET_ACCESS_TOKEN = "matrix.accessToken";
@@ -21,6 +22,31 @@ export function stripInternalMarkers(text) {
 		.replace(/\r\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();
+}
+
+/** Extract text blocks from a completed assistant message, ignoring thinking and tool payloads. */
+function assistantResponseText(message) {
+	const content = message?.content;
+	const text =
+		typeof content === "string"
+			? content
+			: (content || [])
+					.filter((part) => typeof part === "string" || part?.type === "text")
+					.map((part) => (typeof part === "string" ? part : part.text || ""))
+					.join("\n");
+	return stripInternalMarkers(text);
+}
+
+/** Append a completed response segment while preserving earlier tool-assisted segments. */
+function appendResponseSegment(current, segment) {
+	const next = String(segment ?? "").trim();
+	if (!next) return current;
+	return current ? `${current}\n\n--\n\n${next}` : next;
+}
+
+/** Prefix a Matrix message with its room and sender identity for the agent. */
+export function formatMatrixPrompt(roomId, sender, text) {
+	return `[Matrix channel ${roomId} · sender ${sender}]: ${String(text ?? "").trim()}`;
 }
 
 /** Generates a stable, privacy-preserving accountId from Matrix User ID (@user:server). */
@@ -40,6 +66,17 @@ export function extractMatrixText(content = {}, botUserId = "") {
 		text = text.replace(regex, "").trim();
 	}
 	return text;
+}
+
+/** Normalize the Matrix gateway prompt for persistence and request assembly. */
+export function normalizeMatrixSystemPrompt(value) {
+	return String(value ?? "").slice(0, 32_768);
+}
+
+/** Compose the additive Matrix prompt without replacing pi-web-ui's normal prompt. */
+export function composeMatrixSystemPrompt(systemPrompt) {
+	const text = String(systemPrompt ?? "").trim();
+	return text ? `Matrix gateway instructions:\n${text}` : "";
 }
 
 /** Format nested fetch/timeout causes without including credentials. */
@@ -142,11 +179,15 @@ export class MatrixBotBridge {
 	 * @param {object} options
 	 * @param {any} options.host
 	 * @param {() => any} options.getConfig
+	 * @param {() => Record<string, unknown>} [options.getSessionMap]
+	 * @param {(value: Record<string, unknown>) => Promise<void>} [options.setSessionMap]
 	 * @param {(level: string, msg: string) => void} [options.log]
 	 */
-	constructor({ host, getConfig, log } = {}) {
+	constructor({ host, getConfig, getSessionMap = () => ({}), setSessionMap = async () => {}, log } = {}) {
 		this.host = host;
 		this.getConfig = getConfig;
+		this.getSessionMap = getSessionMap;
+		this.setSessionMap = setSessionMap;
 		this.log = log || ((level, msg) => console.log(`[matrix-bot:${level}] ${msg}`));
 
 		this.running = false;
@@ -160,6 +201,8 @@ export class MatrixBotBridge {
 		this.nextBatchLoaded = false;
 
 		this.seenEventIds = new Set();
+		this.channelQueues = new Map();
+		this.activeChannels = new Set();
 		this.pendingRuns = new Map();
 		this.earlyRuns = new Map();
 		this.userConversations = new Map();
@@ -190,6 +233,10 @@ export class MatrixBotBridge {
 
 	getStatus() {
 		return { ...this.status };
+	}
+
+	chatText(key, values = {}) {
+		return matrixChatText(this.getConfig()?.locale, key, values);
 	}
 
 	resolveWorkspace(sender, cfg) {
@@ -242,10 +289,13 @@ export class MatrixBotBridge {
 		this.routingGeneration++;
 		this.routingAccount = this.accountIdentity();
 		this.sessionRoutes.clear();
+		for (const run of new Set(this.pendingRuns.values())) run.finish?.();
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
+		this.cancelQueuedMessages();
 		this.userConversations.clear();
 		this.epochs.clear();
+		await this.setSessionMap({});
 		await this.saveRouting();
 	}
 
@@ -324,8 +374,10 @@ export class MatrixBotBridge {
 
 	async stop() {
 		this.routingGeneration++;
+		for (const run of new Set(this.pendingRuns.values())) run.finish?.();
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
+		this.cancelQueuedMessages();
 		this.running = false;
 		this.status.enabled = false;
 		this.status.connected = false;
@@ -422,6 +474,116 @@ export class MatrixBotBridge {
 		}
 	}
 
+	conversationStorageKey(key, epoch) {
+		return `matrix:${this.routingAccount}:${peerAccountId(key, "scope")}:g${epoch}`;
+	}
+
+	/**
+	 * Create or reopen the background conversation for a Matrix room scope.
+	 *
+	 * Matrix prompts use append mode so the normal pi-web-ui preamble, tool
+	 * guidance, and project context remain intact.
+	 */
+	async ensureConversation(key, roomId, sender, cfg, epoch, workspace) {
+		const systemPrompt = composeMatrixSystemPrompt(cfg.systemPrompt);
+		const ensure = this.host.conversations?.ensure;
+		if (typeof ensure !== "function") {
+			if (systemPrompt) {
+				throw new Error("Matrix system prompts require a pi-web-ui host with conversation profiles.");
+			}
+			const conversationId = this.userConversations.get(key) || `mtx_${randomUUID()}`;
+			this.userConversations.set(key, conversationId);
+			return { conversationId, managed: false };
+		}
+
+		const storageKey = this.conversationStorageKey(key, epoch);
+		const currentSessionMap = this.getSessionMap?.();
+		const sessionMap =
+			currentSessionMap && typeof currentSessionMap === "object" && !Array.isArray(currentSessionMap)
+				? currentSessionMap
+				: {};
+		const saved = sessionMap[storageKey] && typeof sessionMap[storageKey] === "object" ? sessionMap[storageKey] : {};
+		const model = this.preferences.get(key)?.model ?? cfg.model;
+		const thinkingLevel = this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel;
+		const result = await ensure.call(this.host.conversations, {
+			key: storageKey,
+			title: `Matrix · ${sender || roomId}`,
+			...(workspace ? { cwd: workspace } : {}),
+			systemPrompt,
+			systemPromptMode: "append",
+			...(saved.sessionFile ? { sessionFile: saved.sessionFile } : {}),
+			...(model ? { model } : {}),
+			...(thinkingLevel ? { thinkingLevel } : {}),
+		});
+		if (!result?.ok || !result.conversationId) {
+			throw new Error(result?.error || "Could not create or reopen the Matrix conversation.");
+		}
+
+		this.userConversations.set(key, result.conversationId);
+		const next = {
+			...sessionMap,
+			[storageKey]: {
+				conversationId: result.conversationId,
+				...(result.sessionId ? { sessionId: result.sessionId } : {}),
+				...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+				updatedAt: Date.now(),
+			},
+		};
+		while (Object.keys(next).length > 200) delete next[Object.keys(next)[0]];
+		await this.setSessionMap(next).catch((error) => {
+			this.log("warn", `Matrix conversation map persistence failed: ${error.message}`);
+		});
+		return {
+			conversationId: result.conversationId,
+			...(result.sessionId || saved.sessionId ? { sessionId: result.sessionId || saved.sessionId } : {}),
+			managed: true,
+		};
+	}
+
+	/** Queue one room message before processing it.
+	 *
+	 * Matrix sync can deliver a burst of events concurrently. Each room is one
+	 * channel, so its messages must be handled in arrival order and only one
+	 * agent run may be active at a time.
+	 */
+	enqueueChannelMessage(key, roomId, event, textOverride = "") {
+		let resolveDispatch;
+		const dispatched = new Promise((resolve) => {
+			resolveDispatch = resolve;
+		});
+		const queue = this.channelQueues.get(key) || [];
+		queue.push({ key, roomId, event, textOverride, resolveDispatch, dispatched });
+		this.channelQueues.set(key, queue);
+		void this.drainChannel(key);
+		return dispatched;
+	}
+
+	/** Drain one room queue serially, waiting for each run to finish first. */
+	async drainChannel(key) {
+		if (this.activeChannels.has(key)) return;
+		this.activeChannels.add(key);
+		try {
+			for (;;) {
+				const queue = this.channelQueues.get(key);
+				const next = queue?.shift();
+				if (!queue || queue.length === 0) this.channelQueues.delete(key);
+				if (!next) break;
+				await this.processInbound(next);
+			}
+		} finally {
+			this.activeChannels.delete(key);
+			if ((this.channelQueues.get(key)?.length || 0) > 0) void this.drainChannel(key);
+		}
+	}
+
+	/** Drop queued work and release callers waiting for a dispatch. */
+	cancelQueuedMessages() {
+		for (const queue of this.channelQueues.values()) {
+			for (const item of queue) item.resolveDispatch?.();
+		}
+		this.channelQueues.clear();
+	}
+
 	async onInboundMessage(roomId, event) {
 		await this.loadRouting();
 		if (!event || event.sender === this.botUserId || event.content?.msgtype === "m.notice") return;
@@ -433,24 +595,51 @@ export class MatrixBotBridge {
 		if (event.event_id) this.seenEventIds.add(event.event_id);
 		if (this.seenEventIds.size > 500) this.seenEventIds.delete(this.seenEventIds.values().next().value);
 		const threadId = threadOf(event.content);
-		const key = scopeKey(roomId, sender, threadId);
+		const key = channelKey(roomId);
+		let textOverride = "";
+		try {
+			const initialText = extractMatrixText(event.content, this.botUserId);
+			if (/^[/／]/.test(initialText) && !mediaTypes[event.content?.msgtype]) {
+				const command = await this.handleSlashCommand(initialText, {
+					roomId,
+					sender,
+					cfg,
+					key,
+					threadId,
+				});
+				if (!command?.prompt) return;
+				if (command.epoch !== (this.epochs.get(key) || 0)) throw new Error(this.chatText("conversationChanged"));
+				textOverride = command.prompt;
+			}
+		} catch (error) {
+			await this.feedback(
+				roomId,
+				this.chatText("errorPrefix", { detail: matrixChatError(this.getConfig()?.locale, error) }),
+				threadId,
+			);
+			return;
+		}
+		await this.enqueueChannelMessage(key, roomId, event, textOverride);
+	}
+
+	/** Process one queued room message and wait for its agent run to conclude. */
+	async processInbound({ roomId, event, textOverride, resolveDispatch }) {
 		let downloadSignal;
+		let run;
+		const sender = event.sender;
+		const threadId = threadOf(event.content);
+		const key = channelKey(roomId);
 		try {
 			if (event.type === "m.room.encrypted" || this.encryptedRooms.has(roomId))
-				throw new Error("E2EE rooms cannot be decrypted or encrypted by this plugin. Use an unencrypted room.");
-			let text = extractMatrixText(event.content, this.botUserId);
+				throw new Error(this.chatText("e2eeUnsupported"));
+			let text = textOverride || extractMatrixText(event.content, this.botUserId);
 			const content = event.content || {};
-			if (/^[/／]/.test(text) && !mediaTypes[content.msgtype]) {
-				const command = await this.handleSlashCommand(text, { roomId, sender, cfg, key, threadId });
-				if (!command?.prompt) return;
-				if (command.epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，请重试重置提示词");
-				text = command.prompt;
-			}
+			const cfg = this.getConfig();
 			const workspace = this.resolveWorkspace(key, cfg);
 			const epoch = this.epochs.get(key) || 0;
 			const attachments = [];
 			if (mediaTypes[content.msgtype]) {
-				if (this.downloads.has(key)) throw new Error("当前附件正在下载，请等待或 /stop。");
+				if (this.downloads.has(key)) throw new Error(this.chatText("attachmentBusy"));
 				const controller = new AbortController();
 				downloadSignal = controller.signal;
 				this.downloads.set(key, controller);
@@ -467,28 +656,25 @@ export class MatrixBotBridge {
 				if (content.msgtype === "m.image") {
 					const mimeType = content.info?.mimetype;
 					if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType))
-						throw new Error("Unsupported image MIME type");
+						throw new Error(this.chatText("unsupportedImage"));
 					attachments.push({ path: "", imageData: bytes.toString("base64"), mimeType, name });
 				} else attachments.push({ path, mode: "reference", name });
-				text = `${text}\nReceived ${mediaTypes[content.msgtype]} saved at ${JSON.stringify(path)}. Use read on this local path where supported. Images are also attached as imageData for vision-capable models. Audio/video are not transcribed or decoded by the channel; explicitly report unavailable decoding tools.`;
-				await this.sendRoomMessage(
-					roomId,
-					`📎 已保存附件：${path}\n图片随附件传入支持视觉的模型；渠道不转录语音或解码视频。`,
-					threadId,
-				);
 			} else if (content.msgtype && !["m.text", "m.emote"].includes(content.msgtype))
-				throw new Error(`Unsupported Matrix message type: ${content.msgtype}`);
+				throw new Error(this.chatText("unsupportedMessage", { type: content.msgtype }));
 			if (!text) return;
 			if (downloadSignal && this.downloads.get(key)?.signal === downloadSignal) this.downloads.delete(key);
 			downloadSignal?.throwIfAborted();
-			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，取消旧消息派发");
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error(this.chatText("messageCancelled"));
 			this.status.messagesReceived++;
 			this.status.lastMessageAt = Date.now();
-			if ([...this.pendingRuns.values()].some((run) => run.key === key))
-				throw new Error("当前会话仍在运行，请先 /stop 或等待完成。");
-			const conversationId = this.userConversations.get(key) || `mtx_${randomUUID()}`;
-			this.userConversations.set(key, conversationId);
-			const run = {
+			const conversation = await this.ensureConversation(key, roomId, sender, cfg, epoch, workspace);
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error(this.chatText("messageCancelled"));
+			const conversationId = conversation.conversationId;
+			let finishRun;
+			const completion = new Promise((resolve) => {
+				finishRun = resolve;
+			});
+			run = {
 				key,
 				epoch,
 				generation: this.routingGeneration,
@@ -499,22 +685,28 @@ export class MatrixBotBridge {
 				conversationId,
 				requestedId: conversationId,
 				accumulatedText: "",
+				completion,
+				finish: finishRun,
 			};
 			this.pendingRuns.set(conversationId, run);
 			this.dispatching++;
 			try {
 				const result = await this.host.chat({
-					text,
+					text: formatMatrixPrompt(roomId, sender, text),
 					...(attachments.length ? { attachments } : {}),
 					accountId: peerAccountId(`${key}:${this.epochs.get(key) || 0}`),
 					conversationId,
+					...(conversation.sessionId ? { sessionId: conversation.sessionId } : {}),
+					...(conversation.managed ? { strictConversationId: true } : {}),
 					...(workspace ? { cwd: workspace } : {}),
-					...Object.fromEntries(
-						Object.entries({
-							model: this.preferences.get(key)?.model ?? cfg.model,
-							thinkingLevel: this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel,
-						}).filter(([, v]) => v),
-					),
+					...(conversation.managed
+						? {}
+						: Object.fromEntries(
+								Object.entries({
+									model: this.preferences.get(key)?.model ?? cfg.model,
+									thinkingLevel: this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel,
+								}).filter(([, value]) => value),
+							)),
 				});
 				if (
 					run.account !== this.accountIdentity() ||
@@ -542,10 +734,13 @@ export class MatrixBotBridge {
 				const earlyKey = pendingKey;
 				const early = this.earlyRuns.get(earlyKey);
 				this.earlyRuns.delete(earlyKey);
-				if (early?.message) await this.handleRunEvent(early.message);
+				for (const message of early?.messages || []) await this.handleRunEvent(message);
 				if (early?.end) await this.handleRunEvent(early.end);
+				resolveDispatch();
+				if (!run.ended && run.runId) await run.completion;
 			} catch (err) {
 				for (const [id, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(id);
+				run.finish?.();
 				throw err;
 			} finally {
 				this.dispatching--;
@@ -553,7 +748,13 @@ export class MatrixBotBridge {
 			}
 		} catch (err) {
 			if (downloadSignal && this.downloads.get(key)?.signal === downloadSignal) this.downloads.delete(key);
-			await this.feedback(roomId, `❌ ${err.message}`, threadId);
+			await this.feedback(
+				roomId,
+				this.chatText("errorPrefix", { detail: matrixChatError(this.getConfig()?.locale, err) }),
+				threadId,
+			);
+		} finally {
+			resolveDispatch();
 		}
 	}
 
@@ -594,7 +795,7 @@ export class MatrixBotBridge {
 		await this.saveRouting();
 	}
 
-	async handleSlashCommand(cmdText, { roomId, sender, cfg, key = scopeKey(roomId, sender), threadId = "" }) {
+	async handleSlashCommand(cmdText, { roomId, sender, cfg, key = channelKey(roomId), threadId = "" }) {
 		cmdText = cmdText.trim().replace(/^／/, "/");
 		const [command] = cmdText.split(/\s+/);
 		const cmd = command.toLowerCase();
@@ -602,97 +803,109 @@ export class MatrixBotBridge {
 		if (cmd === "/thinking" || (cmd === "/model" && arg.toLowerCase() === "default")) arg = arg.toLowerCase();
 		const epoch = this.epochs.get(key) || 0;
 		const ensureIdle = () => {
-			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，请重试命令");
-			if ([...this.pendingRuns.values()].some((r) => r.key === key))
-				throw new Error("请先 /stop 并等待任务结束，再切换会话设置。");
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error(this.chatText("conversationChanged"));
+			if ([...this.pendingRuns.values()].some((r) => r.key === key)) throw new Error(this.chatText("settingsBusy"));
 		};
 		const reply = (text) => this.sendRoomMessage(roomId, text, threadId);
 		const prefs = this.preferences.get(key) || {};
 		switch (cmd) {
 			case "/help":
-				await reply(
-					"🔮 Matrix 机器人帮助\n/help /new /clear (/reset) /status /stop (/abort)\n/model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default]\n/cwd [absolute path] (/workspace)\n图片作为附件传入支持视觉的模型；文件使用本地路径，语音和视频不自动转录或解码。E2EE 不支持。",
-				);
+				await reply(this.chatText("help"));
 				break;
 			case "/status":
 				await reply(
-					`Matrix: ${this.status.state}\n会话: ${this.userConversations.get(key) || "未开始"}\n运行: ${[...this.pendingRuns.values()].some((r) => r.key === key)}\n模型: ${prefs.model ?? cfg.model ?? "default"}\n思考: ${prefs.thinkingLevel ?? cfg.thinkingLevel ?? "default"}\ncwd: ${this.resolveWorkspace(key, cfg)}\n错误: ${this.status.lastError || "无"}`,
+					this.chatText("status", {
+						state: this.status.state,
+						conversation: this.userConversations.get(key) || this.chatText("notStarted"),
+						running: [...this.pendingRuns.values()].some((r) => r.key === key),
+						model: prefs.model ?? cfg.model ?? "default",
+						thinking: prefs.thinkingLevel ?? cfg.thinkingLevel ?? "default",
+						cwd: this.resolveWorkspace(key, cfg),
+						error: this.status.lastError || this.chatText("none"),
+					}),
 				);
 				break;
 			case "/abort":
 			case "/stop": {
 				const download = this.downloads.get(key);
 				if (download) {
-					download.abort(new Error("附件下载已取消"));
+					download.abort(new Error(this.chatText("attachmentDownloadCancelled")));
 					this.downloads.delete(key);
 				}
 				const run = [...this.pendingRuns.values()].find((r) => r.key === key);
 				if (!run) {
-					await reply(download ? "附件下载已取消。" : "当前没有运行中的任务。");
+					await reply(download ? this.chatText("attachmentDownloadCancelled") : this.chatText("noActiveTask"));
 					break;
 				}
-				if (!run.runId) throw new Error("宿主未提供运行 ID，无法安全停止此任务");
+				if (!run.runId) throw new Error(this.chatText("hostCannotStop"));
 				const result = await this.host.abortRun?.(run.runId);
-				if (!result?.ok) throw new Error(result?.error || "宿主不支持停止任务");
-				await reply("已请求停止当前任务。");
+				if (!result?.ok) throw new Error(result?.error || this.chatText("hostStopUnsupported"));
+				await reply(this.chatText("stopRequested"));
 				break;
 			}
 			case "/clear":
 			case "/reset":
 			case "/new":
 				if ([...this.pendingRuns.values()].some((r) => r.key === key))
-					throw new Error("请先 /stop 并等待任务结束，再开启新会话。");
-				this.downloads.get(key)?.abort(new Error("已开启新会话"));
+					throw new Error(this.chatText("newConversationBusy"));
+				this.downloads.get(key)?.abort(new Error(this.chatText("attachmentAborted")));
 				await this.resetScope(key);
 				this.userConversations.set(key, `mtx_${randomUUID()}`);
 				if (arg) return { prompt: arg, epoch: this.epochs.get(key) };
-				await reply("✨ 已开启全新会话（未删除历史）。");
+				await reply(this.chatText("freshConversation"));
 				break;
 			case "/model":
 				if (arg) {
-					if ([...this.pendingRuns.values()].some((r) => r.key === key))
-						throw new Error("请先 /stop 并等待任务结束，再切换模型。");
+					if ([...this.pendingRuns.values()].some((r) => r.key === key)) throw new Error(this.chatText("stopBusy"));
 					if (arg !== "default") {
 						const models = await this.host.models?.list?.();
 						if (!models?.some((m) => `${m.provider}/${m.id}` === arg))
-							throw new Error("未知或不可用模型；请使用 provider/id");
+							throw new Error(this.chatText("modelUnavailable"));
 					}
 					ensureIdle();
 					this.preferences.set(key, { ...prefs, model: arg === "default" ? "" : arg });
-					this.downloads.get(key)?.abort(new Error("模型已切换"));
+					this.downloads.get(key)?.abort(new Error(this.chatText("model", { model: arg })));
 					await this.resetScope(key);
 					this.userConversations.delete(key);
 				}
-				await reply(`模型: ${this.preferences.get(key)?.model ?? cfg.model ?? "default"}`);
+				await reply(
+					this.chatText("model", {
+						model: this.preferences.get(key)?.model ?? cfg.model ?? "default",
+					}),
+				);
 				break;
 			case "/thinking":
 				if (arg) {
 					if (!["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(arg))
-						throw new Error("无效思考强度");
+						throw new Error(this.chatText("invalidThinking"));
 					ensureIdle();
 					this.preferences.set(key, { ...prefs, thinkingLevel: arg === "default" ? "" : arg });
-					this.downloads.get(key)?.abort(new Error("思考强度已切换"));
+					this.downloads.get(key)?.abort(new Error(this.chatText("thinking", { thinking: arg })));
 					await this.resetScope(key);
 					this.userConversations.delete(key);
 				}
-				await reply(`思考: ${this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel ?? "default"}`);
+				await reply(
+					this.chatText("thinking", {
+						thinking: this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel ?? "default",
+					}),
+				);
 				break;
 			case "/workspace":
 			case "/cwd":
 				if (arg) {
-					if (!isAbsolute(arg)) throw new Error("cwd 必须是绝对目录");
+					if (!isAbsolute(arg)) throw new Error(this.chatText("cwdAbsolute"));
 					const stat = await this.host.fs.statPath(arg);
-					if (stat.type !== "dir") throw new Error("cwd 必须是目录");
+					if (stat.type !== "dir") throw new Error(this.chatText("cwdDirectory"));
 					ensureIdle();
-					this.downloads.get(key)?.abort(new Error("工作区已切换"));
+					this.downloads.get(key)?.abort(new Error(this.chatText("cwd", { cwd: arg })));
 					await this.resetScope(key);
 					this.userWorkspaces.set(key, arg);
 					this.userConversations.delete(key);
 				}
-				await reply(`cwd: ${this.resolveWorkspace(key, cfg)}`);
+				await reply(this.chatText("cwd", { cwd: this.resolveWorkspace(key, cfg) }));
 				break;
 			default:
-				await reply(`未知命令：${command}。使用 /help 查看支持的命令。`);
+				await reply(this.chatText("unknownCommand", { command }));
 		}
 		return true;
 	}
@@ -722,7 +935,10 @@ export class MatrixBotBridge {
 			if (this.dispatching && (ev.type === "message" || ev.type === "run_end")) {
 				const early = this.earlyRuns.get(id) || {};
 				if (ev.type === "run_end") early.end = ev;
-				else if (ev.message?.role === "assistant" || ev.message?.author === "assistant") early.message = ev;
+				else if (ev.message?.role === "assistant" || ev.message?.author === "assistant") {
+					early.messages = Array.isArray(early.messages) ? early.messages : [];
+					if (early.messages.length < 128) early.messages.push(ev);
+				}
 				this.earlyRuns.set(id, early);
 			}
 			return;
@@ -734,17 +950,7 @@ export class MatrixBotBridge {
 			run.epoch === (this.epochs.get(run.key) || 0);
 		if (!isCurrent() || run.ended) return;
 		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
-			const content = ev.message.content;
-			run.accumulatedText =
-				ev.message.stopReason === "toolUse" ||
-				(Array.isArray(content) && content.some((part) => part.type === "toolCall"))
-					? ""
-					: typeof content === "string"
-						? content
-						: (content || [])
-								.filter((part) => typeof part === "string" || part.type === "text")
-								.map((part) => (typeof part === "string" ? part : part.text || ""))
-								.join("\n");
+			run.accumulatedText = appendResponseSegment(run.accumulatedText, assistantResponseText(ev.message));
 		}
 		if (ev.type === "run_end") {
 			run.ended = true;
@@ -755,18 +961,19 @@ export class MatrixBotBridge {
 			for (const [pendingId, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(pendingId);
 			const ending =
 				ev.stopReason === "aborted"
-					? "任务已停止。"
+					? this.chatText("stopped")
 					: ev.isError || ev.error || ev.stopReason === "error"
-						? `任务失败：${ev.error || "模型运行错误"}`
+						? this.chatText("failed", { detail: ev.error || this.chatText("modelError") })
 						: "";
 			const text =
-				[stripInternalMarkers(run.accumulatedText), ending].filter(Boolean).join("\n\n") || "任务结束（无文本输出）。";
+				[stripInternalMarkers(run.accumulatedText), ending].filter(Boolean).join("\n\n") || this.chatText("noOutput");
 			for (const chunk of chunkMarkdownText(text, 3800)) {
 				if (!isCurrent()) break;
 				await this.feedback(run.roomId, chunk, run.threadId, isCurrent);
 			}
 			this.status.messagesReplied++;
 			this.status.lastReplyAt = Date.now();
+			run.finish?.();
 		}
 	}
 }
@@ -799,12 +1006,19 @@ export function mergeSavedSecrets(incoming, prev = {}, savedSecrets = {}) {
 
 export default async function activate(host) {
 	let localConfig = (await host.storage.get("config")) || {};
+	let sessionMap = (await host.storage.get("channelSessions")) || {};
 	const savedSecrets = (await host.secrets?.getAll?.()) || {};
 	localConfig = mergeSavedSecrets(localConfig, {}, savedSecrets);
+	localConfig.locale = normalizeMatrixLocale(localConfig.locale);
 
 	const botBridge = new MatrixBotBridge({
 		host,
 		getConfig: () => localConfig,
+		getSessionMap: () => sessionMap,
+		setSessionMap: async (next) => {
+			sessionMap = next && typeof next === "object" && !Array.isArray(next) ? next : {};
+			await host.storage.set("channelSessions", sessionMap);
+		},
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
 
@@ -881,6 +1095,15 @@ export default async function activate(host) {
 				...(requestId ? { reqId: requestId } : {}),
 			});
 		try {
+			if (typeof msg?.locale === "string") {
+				const nextLocale = normalizeMatrixLocale(msg.locale);
+				if (localConfig.locale !== nextLocale) {
+					localConfig.locale = nextLocale;
+					await host.storage.set("config", stripSecretsFromConfig(localConfig)).catch((error) => {
+						host.log?.("warn", `Matrix UI locale persistence failed: ${error.message}`);
+					});
+				}
+			}
 			switch (msg.type) {
 				case "get_state": {
 					const secrets = (await host.secrets?.getAll?.()) || {};
@@ -892,6 +1115,8 @@ export default async function activate(host) {
 							workspace: localConfig.workspace || "",
 							model: localConfig.model || "",
 							thinkingLevel: localConfig.thinkingLevel || "",
+							systemPrompt: normalizeMatrixSystemPrompt(localConfig.systemPrompt),
+							locale: localConfig.locale,
 							botEnabled: Boolean(localConfig.botEnabled),
 							allowedUsers: localConfig.allowedUsers || [],
 							hasAccessToken: Boolean(secrets[SECRET_ACCESS_TOKEN] || localConfig.accessToken),
@@ -902,11 +1127,17 @@ export default async function activate(host) {
 					break;
 				}
 
+				case "set_locale": {
+					reply({ type: "locale_saved", success: true, locale: localConfig.locale });
+					break;
+				}
+
 				case "save_config": {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
 					await botBridge.loadRouting();
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					localConfig.systemPrompt = normalizeMatrixSystemPrompt(localConfig.systemPrompt);
 					if (botBridge.routingAccount !== botBridge.accountIdentity()) await botBridge.invalidateRouting();
 
 					if (host.secrets) {
@@ -936,7 +1167,12 @@ export default async function activate(host) {
 					const testCfg = mergeSavedSecrets(incoming, localConfig, secrets);
 
 					if (!testCfg.homeserverUrl || !testCfg.accessToken) {
-						reply({ type: "test_config_done", success: false, message: "未填入 Homeserver URL 或 Access Token" });
+						reply({
+							type: "test_config_done",
+							success: false,
+							message: "未填入 Homeserver URL 或 Access Token",
+							messageEn: "Homeserver URL and Access Token are required.",
+						});
 						break;
 					}
 
@@ -953,9 +1189,16 @@ export default async function activate(host) {
 							type: "test_config_done",
 							success: true,
 							message: `连接成功！已验证 Matrix 用户：${whoami.user_id}`,
+							messageEn: `Connection successful. Verified Matrix user: ${whoami.user_id}`,
 						});
 					} catch (err) {
-						reply({ type: "test_config_done", success: false, message: `连接失败: ${formatMatrixError(err)}` });
+						const detail = formatMatrixError(err);
+						reply({
+							type: "test_config_done",
+							success: false,
+							message: `连接失败: ${detail}`,
+							messageEn: `Connection failed: ${detail}`,
+						});
 					}
 					break;
 				}

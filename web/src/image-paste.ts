@@ -1,9 +1,9 @@
 /**
  * Client-side image normalization for paste / drag-drop / upload:
  * downscale to a vision-friendly size and re-encode so the payload stays
- * well under the server's 2MB cap for pasted images (MAX_PASTED_IMAGE_BYTES
- * in agent-service.ts). Keeps EXIF orientation and transparency where
- * possible.
+ * below 2MB for provider-friendly prompts. The server accepts larger inline
+ * images from validated transport plugins, but browser uploads stay compact.
+ * Keeps EXIF orientation and transparency where possible.
  */
 
 export interface ProcessedImage {
@@ -17,7 +17,7 @@ export interface ProcessedImage {
 
 /** Largest edge (px) we send to the model — covers ~1.5K vision crops. */
 const MAX_DIMENSION = 1568;
-/** Must match server MAX_PASTED_IMAGE_BYTES (agent-service.ts). */
+/** Target size for browser-side image compression. */
 const MAX_BYTES = 2 * 1024 * 1024;
 
 /**

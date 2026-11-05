@@ -143,9 +143,11 @@ describe("host.chat 四件套透传（issue #226）", () => {
 			accountId: "signal-peer",
 			conversationId: "c1",
 			strictConversationId: true,
-			attachments: [{ path: "", name: "photo.png", mimeType: "image/png", imageData }],
+			attachments: [{ name: "photo.png", mimeType: "image/png", imageData }],
 		});
-		expect(got?.attachments).toMatchObject([{ path: "", name: "photo.png", mimeType: "image/png", imageData }]);
+		expect(got?.attachments).toEqual([
+			{ path: "", name: "photo.png", mimeType: "image/png", imageData, size: 14 },
+		]);
 	});
 	it("rejects unsupported image attachment types", async () => {
 		makeChatter("badimage", ["chat"]);
@@ -154,9 +156,9 @@ describe("host.chat 四件套透传（issue #226）", () => {
 		await expect(
 			host.chat({
 				text: "image",
-				attachments: [{ path: "", mimeType: "text/html", imageData: "PGgxPg==" }],
+				attachments: [{ mimeType: "text/html", imageData: "PGgxPg==" }],
 			}),
-		).rejects.toThrow(/image MIME must be/);
+		).rejects.toThrow(/image MIME/);
 	});
 	it("不传四件套时只发 text+accountId（老插件语义不变）", async () => {
 		makeChatter("chatter", ["chat"]);

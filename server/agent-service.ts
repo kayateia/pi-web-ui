@@ -606,6 +606,7 @@ export { workspacePath };
  */
 export interface Conversation {
 	id: string;
+	/** Channel-owned conversation that must not be opened as a shared viewer. */
 	independent?: boolean;
 	/** Display title: first user prompt (truncated) or the default. */
 	title: string;
@@ -4757,23 +4758,6 @@ export class ClientSession {
 		return this.goalSvc.makeGoalStatus();
 	}
 
-	private readConversationIndependent(session: AgentSession): boolean {
-		let independent = !isPseudoClientId(this.clientId ?? "") && !this.clientId?.startsWith("device-task-");
-		for (const entry of session.sessionManager.getEntries()) {
-			if (entry.type === "custom" && entry.customType === "webui/independent")
-				independent = (entry.data as { independent?: boolean } | undefined)?.independent !== false;
-		}
-		return independent;
-	}
-
-	setConversationIndependent(id: string, independent: boolean): void {
-		const conv = this.convs.get(id);
-		if (!conv) return;
-		conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
-		conv.independent = independent;
-		this.emitConversations();
-	}
-
 	/** Allocate a stable conversation id before constructing its runtime/tools. */
 	private nextConversationId(): string {
 		return `c${++this.convSeq}`;
@@ -4948,6 +4932,23 @@ export class ClientSession {
 		}
 		this.restorePlan(conv);
 		return conv;
+	}
+
+	private readConversationIndependent(session: AgentSession): boolean {
+		let independent = !isPseudoClientId(this.clientId ?? "") && !this.clientId?.startsWith("device-task-");
+		for (const entry of session.sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === "webui/independent")
+				independent = (entry.data as { independent?: boolean } | undefined)?.independent !== false;
+		}
+		return independent;
+	}
+
+	setConversationIndependent(id: string, independent: boolean): void {
+		const conv = this.convs.get(id);
+		if (!conv) return;
+		conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
+		conv.independent = independent;
+		this.emitConversations();
 	}
 
 	/** 会话计划回放恢复：持久化文件（sessionId）→ 转录 customType → 历史消息三重兜底。 */
@@ -5578,24 +5579,6 @@ export class ClientSession {
 		}
 	}
 
-	/** Resolve a plugin run by its token, independently of active/local conversation IDs. */
-	findPluginRun(runId: string): Conversation | undefined {
-		if (!runId) return undefined;
-		return [...this.convs.values()].find((conv) => conv.pluginRunId === runId || conv.pendingPluginRunId === runId);
-	}
-
-	async abortPluginRun(runId: string): Promise<{ ok: boolean; error?: string }> {
-		const conv = this.findPluginRun(runId);
-		if (!conv) return { ok: false, error: `Unknown plugin run: ${runId}` };
-		try {
-			await this.interruptRun(conv, "插件已中止运行");
-			this.flushSnapshot();
-			return { ok: true };
-		} catch (err) {
-			return { ok: false, error: (err as Error).message };
-		}
-	}
-
 	/**
 	 * Create or reopen a visible background conversation for a transport plugin.
 	 *
@@ -5631,6 +5614,7 @@ export class ClientSession {
 				return {
 					ok: true,
 					conversationId: existingConv.id,
+					sessionId: existingConv.session.sessionId,
 					...(existingConv.session.sessionFile ? { sessionFile: existingConv.session.sessionFile } : {}),
 				};
 			}
@@ -5662,6 +5646,7 @@ export class ClientSession {
 					return {
 						ok: true,
 						conversationId: openedHere.id,
+						sessionId: openedHere.session.sessionId,
 						sessionFile: openedHere.session.sessionFile,
 					};
 				}
@@ -5748,6 +5733,7 @@ export class ClientSession {
 			return {
 				ok: true,
 				conversationId: conv.id,
+				sessionId: conv.session.sessionId,
 				...(conv.session.sessionFile ? { sessionFile: conv.session.sessionFile } : {}),
 			};
 		} catch (err) {
@@ -5863,6 +5849,25 @@ export class ClientSession {
 				await this.interruptRun(conv, "插件已中止运行");
 				this.flushSnapshot();
 			}
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: (err as Error).message };
+		}
+	}
+
+	/** Resolve a stable plugin run token to its current conversation. */
+	findPluginRun(runId: string): Conversation | undefined {
+		if (!runId) return undefined;
+		return [...this.convs.values()].find((conv) => conv.pluginRunId === runId || conv.pendingPluginRunId === runId);
+	}
+
+	/** Abort a plugin run by stable token, safe across conversation transfer. */
+	async abortPluginRun(runId: string): Promise<{ ok: boolean; error?: string }> {
+		const conv = this.findPluginRun(runId);
+		if (!conv) return { ok: false, error: `Unknown plugin run: ${runId}` };
+		try {
+			await this.interruptRun(conv, "插件已中止运行");
+			this.flushSnapshot();
 			return { ok: true };
 		} catch (err) {
 			return { ok: false, error: (err as Error).message };

@@ -9,7 +9,9 @@ import { describe, expect, it, vi } from "vitest";
 // @ts-expect-error jsdom does not ship declarations in this workspace
 import { JSDOM } from "jsdom";
 import {
+	composeMatrixSystemPrompt,
 	extractMatrixText,
+	formatMatrixPrompt,
 	formatMatrixError,
 	matrixApi,
 	MatrixBotBridge,
@@ -18,8 +20,37 @@ import {
 } from "../../plugins/matrix/index.mjs";
 import activateMatrixPlugin from "../../plugins/matrix/index.mjs";
 import matrixClient from "../../plugins/matrix/client/entry.mjs";
+import { matrixChatError, matrixChatText } from "../../plugins/matrix/chat-i18n.mjs";
+import { matrixTranslator, resolveMatrixLocale } from "../../plugins/matrix/client/i18n.mjs";
 
 describe("Matrix 纯函数与辅助方法测试", () => {
+	it("translates the Matrix panel from the host locale", () => {
+		expect(resolveMatrixLocale("zh-TW")).toBe("zh");
+		expect(resolveMatrixLocale("en-US")).toBe("en");
+		expect(matrixTranslator("zh")("messageCount", { count: 3 })).toBe("3 条");
+		expect(matrixTranslator("en")("messageCount", { count: 3 })).toBe("3 messages");
+	});
+
+	it("translates chat-facing gateway messages", () => {
+		expect(matrixChatText("en", "unknownCommand", { command: "/bad" })).toContain("Unknown command");
+		expect(matrixChatText("zh-TW", "unknownCommand", { command: "/bad" })).toContain("未知命令");
+		expect(matrixChatError("zh", new Error("Media exceeds 10 MiB limit"))).toContain("10 MiB");
+		expect(matrixChatError("zh", new Error("Media exceeds 10 MiB limit"))).toContain("媒体超过");
+	});
+
+	it("composes an additive Matrix prompt with the Signal-style heading", () => {
+		expect(composeMatrixSystemPrompt("  Stay within this room's rules.  ")).toBe(
+			"Matrix gateway instructions:\nStay within this room's rules.",
+		);
+		expect(composeMatrixSystemPrompt("   ")).toBe("");
+	});
+
+	it("attributes every Matrix prompt to its room and sender", () => {
+		expect(formatMatrixPrompt("!room:matrix.org", "@alice:matrix.org", " hello ")).toBe(
+			"[Matrix channel !room:matrix.org · sender @alice:matrix.org]: hello",
+		);
+	});
+
 	it("stripInternalMarkers 剥离内部标记与清理空行", () => {
 		const raw = "这是回答[[plan:123]]中间内容[[conv:xyz]]结尾。\n\n\n新行";
 		expect(stripInternalMarkers(raw)).toBe("这是回答中间内容结尾。\n\n新行");
@@ -88,7 +119,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 			expect.stringContaining("/send/m.room.message/"),
 			expect.objectContaining({
 				method: "PUT",
-				body: expect.stringContaining("Matrix 机器人帮助"),
+				body: expect.stringContaining("Matrix bot help"),
 			}),
 		);
 
@@ -130,7 +161,7 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 
 		expect(chatSpy).toHaveBeenCalledWith(
 			expect.objectContaining({
-				text: "帮我写一个函数",
+				text: "[Matrix channel !room1:matrix.org · sender @alice:matrix.org]: 帮我写一个函数",
 				accountId: expect.stringMatching(/^mtx_/),
 			}),
 		);
@@ -163,6 +194,68 @@ describe("MatrixBotBridge 双工逻辑测试", () => {
 
 		await bridge.stop();
 		vi.unstubAllGlobals();
+	});
+
+	it("appends the configured Matrix prompt through a managed conversation", async () => {
+		const ensureSpy = vi.fn().mockResolvedValue({
+			ok: true,
+			conversationId: "conv_matrix_profile",
+			sessionId: "session_matrix_profile",
+			sessionFile: "/sessions/matrix-profile.jsonl",
+		});
+		const chatSpy = vi.fn().mockResolvedValue({
+			conversationId: "conv_matrix_profile",
+			clientId: "client_matrix",
+			runId: "run_matrix_profile",
+		});
+		const setSessionMap = vi.fn().mockResolvedValue(undefined);
+		const bridge = new MatrixBotBridge({
+			host: {
+				chat: chatSpy,
+				conversations: { ensure: ensureSpy },
+			},
+			getConfig: () => ({
+				homeserverUrl: "https://matrix.org",
+				accessToken: "mock_token",
+				systemPrompt: "Always address the room moderator by name.",
+				model: "provider/model",
+				thinkingLevel: "high",
+			}),
+			getSessionMap: () => ({}),
+			setSessionMap,
+		});
+
+		await bridge.onInboundMessage("!room1:matrix.org", {
+			event_id: "$prompt_profile",
+			sender: "@alice:matrix.org",
+			content: { body: "Hello" },
+		});
+
+		expect(ensureSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				systemPrompt: "Matrix gateway instructions:\nAlways address the room moderator by name.",
+				systemPromptMode: "append",
+				model: "provider/model",
+				thinkingLevel: "high",
+				title: "Matrix · @alice:matrix.org",
+			}),
+		);
+		expect(chatSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				conversationId: "conv_matrix_profile",
+				sessionId: "session_matrix_profile",
+				strictConversationId: true,
+			}),
+		);
+		expect(chatSpy.mock.calls[0][0]).not.toHaveProperty("model");
+		expect(chatSpy.mock.calls[0][0]).not.toHaveProperty("thinkingLevel");
+		const persistedSessions = setSessionMap.mock.calls[0][0];
+		const persistedKey = Object.keys(persistedSessions).find((key) => key.endsWith(":g0"));
+		expect(persistedKey).toBeTruthy();
+		expect(persistedSessions[persistedKey!]).toMatchObject({
+			conversationId: "conv_matrix_profile",
+			sessionFile: "/sessions/matrix-profile.jsonl",
+		});
 	});
 
 	it("Matrix 门控与防重放：忽略 m.notice 机器人通知消息，且支持游标持久化", async () => {
@@ -217,12 +310,13 @@ describe("Matrix configuration diagnostics", () => {
 		};
 		const cleanup = await activateMatrixPlugin(host);
 		let replyPayload: Record<string, unknown> | undefined;
-		await onClientMessage?.({ type: "get_state", reqId: "matrix-state-1" }, (payload) => {
+		await onClientMessage?.({ type: "get_state", reqId: "matrix-state-1", locale: "zh-TW" }, (payload) => {
 			replyPayload = payload as Record<string, unknown>;
 		});
 		expect(replyPayload).toMatchObject({
 			type: "state",
 			reqId: "matrix-state-1",
+			config: { locale: "zh" },
 		});
 		await cleanup();
 	});
@@ -309,6 +403,9 @@ describe("Matrix configuration diagnostics", () => {
 		while (!root.querySelector(".matrix-btn-save-cfg") && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
+		expect(root.textContent).toContain("Matrix (decentralized) bot workspace");
+		expect(root.textContent).toContain("Configure credentials");
+		expect(root.querySelector(".matrix-cfg-system-prompt")).toBeTruthy();
 		root.querySelector(".matrix-btn-save-cfg").dispatchEvent(new dom.window.Event("click"));
 		while (alerts.length === 0 && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, 5));

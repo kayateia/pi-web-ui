@@ -71,7 +71,11 @@ describe("Matrix reset command lifecycle", () => {
 		await send("/reset");
 		for (const prompt of ["/model DEFAULT", "DeFaUlT", "／UNKNOWN keep CASE"]) {
 			await send(command + " " + prompt);
-			expect(host.chat).toHaveBeenLastCalledWith(expect.objectContaining({ text: prompt }));
+			expect(host.chat).toHaveBeenLastCalledWith(
+				expect.objectContaining({
+					text: `[Matrix channel room · sender user]: ${prompt}`,
+				}),
+			);
 			await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1)!.value).runId });
 		}
 	});
@@ -141,7 +145,7 @@ describe("Matrix reset command lifecycle", () => {
 			await send(cmd);
 		expect(bridge.epochs.get(key())).toBe(1);
 		expect(host.chat).not.toHaveBeenCalled();
-		expect(bridge.sendRoomMessage.mock.calls.some(([, text]: any[]) => text.includes("未知命令"))).toBe(true);
+		expect(bridge.sendRoomMessage.mock.calls.some(([, text]: any[]) => text.includes("Unknown command"))).toBe(true);
 	});
 	it.each(commands)("%s cannot change a running context", async (command) => {
 		const { bridge, send, key } = setup();
