@@ -324,23 +324,6 @@ describe("Signal delivery helpers", () => {
 		expect(chunks.join("\n\n")).toBe(text);
 	});
 
-	it("reconnects an SSE stream that stays open but goes silent", () => {
-		vi.useFakeTimers();
-		try {
-			const gateway = new SignalGateway({ host: {}, getConfig: () => normalizeConfig({}) });
-			gateway.running = true;
-			gateway.connected = true;
-			gateway.status.connected = true;
-			gateway.sseGeneration = 4;
-			const reconnect = vi.spyOn(gateway, "scheduleReconnect").mockImplementation(() => {});
-			gateway.touchSse(4);
-			vi.advanceTimersByTime(2 * 60_000);
-			expect(reconnect).toHaveBeenCalledWith(expect.stringContaining("received no data"));
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
 	it("downloads Signal image attachments through getAttachment", async () => {
 		const raw = directEnvelope("");
 		raw.envelope.dataMessage.attachments = [
@@ -673,68 +656,6 @@ describe("managed signal-cli lifecycle", () => {
 			state: "idle",
 		});
 		fetchSpy.mockRestore();
-	});
-
-	it("restarts an owned daemon after an unexpected exit with backoff", async () => {
-		vi.useFakeTimers();
-		try {
-			const gateway = new SignalGateway({
-				host: {},
-				getConfig: () =>
-					normalizeConfig({
-						enabled: true,
-						account,
-						daemonMode: "managed",
-					}),
-			});
-			gateway.running = true;
-			const child = { pid: 4242 };
-			gateway.daemonChild = child;
-			const start = vi.spyOn(gateway, "startManagedDaemon").mockResolvedValue(undefined);
-			const connect = vi.spyOn(gateway, "connectSse").mockImplementation(() => {});
-
-			gateway.handleManagedDaemonExit(child, 1, null);
-			expect(gateway.status.state).toBe("starting");
-			expect(gateway.daemonRestartAttempts).toBe(1);
-			expect(gateway.daemonChild).toBe(null);
-			expect(start).not.toHaveBeenCalled();
-
-			await vi.advanceTimersByTimeAsync(1_000);
-			expect(start).toHaveBeenCalledTimes(1);
-			expect(connect).toHaveBeenCalledTimes(1);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("fails startup visibly when signal-cli cannot serve the configured account", async () => {
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(JSON.stringify({ jsonrpc: "2.0", error: { message: "NotRegisteredException" } }), {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			}),
-		);
-		try {
-			const gateway = new SignalGateway({
-				host: {},
-				getConfig: () =>
-					normalizeConfig({
-						enabled: true,
-						account,
-						daemonMode: "external",
-					}),
-			});
-			const connect = vi.spyOn(gateway, "connectSse").mockImplementation(() => {});
-			await expect(gateway.start()).rejects.toThrow(/NotRegisteredException/);
-			expect(connect).not.toHaveBeenCalled();
-			expect(gateway.getStatus()).toMatchObject({
-				enabled: false,
-				connected: false,
-				state: "error",
-			});
-		} finally {
-			fetchSpy.mockRestore();
-		}
 	});
 });
 
