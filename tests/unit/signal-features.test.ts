@@ -442,6 +442,44 @@ describe("Signal delivery helpers", () => {
 		expect(gateway.pendingRuns.size).toBe(0);
 	});
 
+	it("accepts the host's 500-character run-start task truncation for a stable run", async () => {
+		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
+		const gateway = new SignalGateway({ host: {}, getConfig: () => normalizeConfig({}) });
+		const sent: string[] = [];
+		gateway.sendText = async (_channel, text) => {
+			sent.push(text);
+		};
+		gateway.react = async () => {};
+		gateway.unreact = async () => {};
+		const expectedTask = `[Signal DM]: ${"x".repeat(600)}`;
+		const pending = {
+			conversationId: "c1",
+			runId: "",
+			parsed,
+			expectedTask,
+			text: "",
+			timeout: null,
+		};
+		gateway.pendingRuns.set("c1", pending);
+		gateway.bindPendingRun(pending, "pr-long");
+
+		gateway.handleRunEvent({
+			type: "run_start",
+			conversationId: "c1",
+			runId: "pr-long",
+			task: expectedTask.slice(0, 500),
+		});
+		gateway.handleRunEvent({
+			type: "message",
+			conversationId: "c1",
+			runId: "pr-long",
+			message: { role: "assistant", content: "reply" },
+		});
+		gateway.handleRunEvent({ type: "run_end", conversationId: "c1", runId: "pr-long" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(sent).toEqual(["reply"]);
+	});
+
 	it("passes the composed global + channel prompt as an append layer", async () => {
 		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
 		const config = normalizeConfig({
