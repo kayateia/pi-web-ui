@@ -14,6 +14,7 @@
  */
 import { join, resolve } from "node:path";
 import { statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { VERSION, getAgentDir, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { ClientStateStore } from "./client-state.js";
 import { ClaimStore } from "./claim-store.js";
@@ -25,6 +26,7 @@ import { isRemoteWorkspaceUri, resolveWorkspaceSessionDir } from "./remote-ssh-s
 import { getMaxOpenConversations } from "./agent-formatters.js";
 import { collectSubagentDescendantIds } from "./subagents.js";
 import { pickLatestClientSnapshot } from "./plugin-conversation-view.js";
+import { normalizePluginChatAttachments } from "./plugin-chat-attachments.js";
 import type { ToolGuardHook } from "./tool-guards.js";
 import type {
 	ServerMessage,
@@ -33,6 +35,7 @@ import type {
 	ElsewhereRunning,
 	BgServer,
 	AgentEngineCapabilities,
+	PromptAttachment,
 } from "./protocol.js";
 import { DEFAULT_PI_CAPABILITIES } from "./engine-capabilities.js";
 import type {
@@ -43,6 +46,7 @@ import type {
 	PluginCommandDef,
 	PluginConversationQuery,
 	PluginChatRequest,
+	PluginChatAttachment,
 	PluginChatResult,
 } from "./plugins.js";
 import type { SchedulerStore } from "./scheduler-tasks.js";
@@ -55,6 +59,37 @@ import {
 	type ProjectRunnerInfo,
 	type TakeoverPayload,
 } from "./agent-service.js";
+
+/** Convert validated plugin images into SDK prompt image blocks. */
+function pluginImages(attachments: PluginChatAttachment[] | undefined) {
+	return (attachments ?? []).flatMap((attachment) =>
+		attachment.imageData
+			? [
+					{
+						type: "image" as const,
+						data: attachment.imageData,
+						mimeType: attachment.mimeType || "image/png",
+					},
+				]
+			: [],
+	);
+}
+
+/** Convert plugin images into the normal attachment pipeline's image shape. */
+function pluginPromptAttachments(attachments: PluginChatAttachment[] | undefined): PromptAttachment[] {
+	return (attachments ?? []).flatMap((attachment) =>
+		attachment.imageData
+			? [
+					{
+						path: "",
+						imageData: attachment.imageData,
+						mimeType: attachment.mimeType || "image/png",
+						name: attachment.name || "Signal image",
+					},
+				]
+			: [],
+	);
+}
 
 export class AgentService {
 	static isPseudoClientId = isPseudoClientId;
@@ -200,7 +235,7 @@ export class AgentService {
 	async wakeConversation(
 		id: string,
 		text: string,
-		opts?: { sessionFile?: string; cwd?: string },
+		opts?: { sessionFile?: string; cwd?: string; attachments?: PluginChatAttachment[] },
 	): Promise<{
 		ok: boolean;
 		conversationId?: string;
@@ -211,7 +246,10 @@ export class AgentService {
 	}> {
 		const wantFile = String(opts?.sessionFile ?? "").trim();
 		const wantCwd = String(opts?.cwd ?? "").trim();
-		if ((!id && !wantFile) || !text.trim()) return { ok: false, error: "唤醒目标或文本为空" };
+		const images = pluginImages(opts?.attachments);
+		if ((!id && !wantFile) || (!text.trim() && images.length === 0)) {
+			return { ok: false, error: "唤醒目标或文本为空" };
+		}
 		if (this.quiesced) return { ok: false, error: "服务器正忙（quiesced），请稍后重试" };
 		const liveFile = (c: Conversation): string => {
 			try {
@@ -243,7 +281,7 @@ export class AgentService {
 			let busyError: string | undefined;
 			for (const h of hits) {
 				try {
-					const r = await h.cs.trySteerScheduler(h.conv, text);
+					const r = await h.cs.trySteerScheduler(h.conv, text, images);
 					if (r.ok) {
 						flush(h.cs);
 						return { ok: true, conversationId: h.conv.id, sessionFile: liveFile(h.conv), clientId: h.clientId };
@@ -279,7 +317,7 @@ export class AgentService {
 			let busyError: string | undefined;
 			for (const h of hits) {
 				try {
-					const r = await h.cs.trySteerScheduler(h.conv, text);
+					const r = await h.cs.trySteerScheduler(h.conv, text, images);
 					if (r.ok) {
 						flush(h.cs);
 						return { ok: true, conversationId: h.conv.id, sessionFile: liveFile(h.conv), clientId: h.clientId };
@@ -623,15 +661,25 @@ export class AgentService {
 		const acct = String(req?.accountId ?? "default").replace(/[^A-Za-z0-9_-]/g, "") || "default";
 		const clientId = `plugin:${safe}:${acct}`;
 		const text = String(req?.text ?? "");
-		if (!text.trim()) throw new Error("chatFromPlugin: text 为空");
+		const attachments = normalizePluginChatAttachments(req?.attachments);
+		if (!text.trim() && !attachments?.length) throw new Error("chatFromPlugin: text and attachments are empty");
 		if (this.quiesced) throw new QuiesceRejectedError("插件无头调用被拒绝，请等服务器恢复后重试");
+		const runId = `pr-${randomUUID()}`;
 		// 1. 绑定已有会话：steer 语义投递，网页端实时可见（微信当远程遥控器用）。
 		// miss/已回收时不抛错，回落无头伪客户端（浏览器关着时微信照常可用）。
 		const target = String(req?.conversationId ?? "").trim();
 		if (target) {
-			const w = await this.wakeConversation(target, text);
+			const w = await this.wakeConversation(target, text, { attachments });
 			if (w.ok) return { conversationId: target, clientId: w.clientId ?? clientId };
+			if (req?.strictConversationId === true) {
+				throw new Error(
+					w.busy
+						? `目标对话正忙，拒绝回落到其他会话：${w.error ?? target}`
+						: `目标对话不可用，拒绝回落到其他会话：${w.error ?? target}`,
+				);
+			}
 		}
+		if (req?.strictConversationId === true) throw new Error("strictConversationId 需要有效的 conversationId");
 		// 2. 工作空间：不传回落伪客户端当前目录；传了必须存在且非系统目录。
 		const cwdReq = String(req?.cwd ?? "").trim();
 		let cwdAbs = "";
@@ -641,6 +689,7 @@ export class AgentService {
 			cwdAbs = chk.abs ?? "";
 		}
 		const cs = await this.attach(clientId, () => {});
+		cs.setConversationIndependent(cs.readConversationForPlugins()!.conversationId, req.independent ?? false);
 		try {
 			if (cwdAbs && cs.cwd !== cwdAbs) await cs.setCwd(cwdAbs);
 		} catch (err) {
@@ -662,9 +711,24 @@ export class AgentService {
 				throw new Error(`chatFromPlugin: 切换思考强度失败（${thinking}）：${(err as Error).message}`);
 			}
 		}
-		const conversationId = cs.readConversationForPlugins()?.conversationId ?? "";
-		void cs.prompt(text);
-		return { conversationId, clientId };
+		let stampedId = "";
+		try {
+			stampedId = cs.markPluginRun(runId);
+		} catch {
+			/* best effort */
+		}
+		const conversationId = stampedId || (cs.readConversationForPlugins()?.conversationId ?? "");
+		const conv = cs.getConversation(conversationId);
+		void cs.prompt(text, attachments, false, conv).catch((err) => console.error("[plugin chat] prompt failed", err));
+		return { conversationId, clientId, sessionId: conv?.session.sessionId, runId };
+	}
+
+	/** Abort by stable plugin run token, including after conversation takeover. */
+	async abortPluginRun(runId: string): Promise<{ ok: boolean; error?: string }> {
+		for (const owner of this.clients.values()) {
+			if (owner.findPluginRun(runId)) return owner.abortPluginRun(runId);
+		}
+		return { ok: false, error: "Plugin run is no longer active" };
 	}
 
 	/** 内置定时任务的无头执行（issue #184，server/scheduler-tasks.ts 的 executor）。

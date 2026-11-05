@@ -70,6 +70,7 @@ import { normalizeIconSvg } from "./icon-svg.js";
 import { PluginDomConsent, declarationWantsDom } from "./plugin-dom.js";
 import { validatePluginManifest, formatManifestIssue, isKnownPermission } from "./plugin-manifest-validate.js";
 import { buildPluginApiCatalog } from "./plugin-api-catalog.js";
+import { normalizePluginChatAttachments } from "./plugin-chat-attachments.js";
 import { AGENT_TOOL_CATALOG } from "./tool-manager.js";
 import {
 	applyPostEdit,
@@ -103,7 +104,7 @@ import {
 	type McpInstallResult,
 } from "./mcp-manager.js";
 import type { McpBridge } from "./mcp-bridge.js";
-import type { UiMcpServer } from "./protocol.js";
+import type { PromptAttachment, UiMcpServer } from "./protocol.js";
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -205,10 +206,16 @@ export interface PluginConversationSnapshot {
  * 文件改动 → 产出结果」聚成时间线；payload 全部截断封顶，可直接存/广播。
  */
 export interface PluginRunEvent {
+	/** Stable SDK session identity, retained across viewer changes and ownership transfer. */
+	sessionId?: string;
 	type:
 		"run_start" | "run_end" | "turn_start" | "turn_end" | "turn_first_token" | "message" | "tool_start" | "tool_end";
 	/** 事件所属对话。 */
 	conversationId?: string;
+	/** Event source client id; unstable across ownership transfer. */
+	clientId?: string;
+	/** Stable id for the plugin-driven run, retained across transfer and id renames. */
+	runId?: string;
 	/** 事件毫秒时间戳（服务端时钟）。 */
 	at: number;
 	/** run_start：触发本轮的用户任务文本（截断 500 字；steer 等内部续跑为空）。 */
@@ -236,6 +243,10 @@ export interface PluginRunEvent {
  *  issue #226：对齐定时任务（chatFromScheduler）的四件套——cwd 不传时回落
  *  该伪客户端当前目录（首次即宿主启动目录），传了则做存在性 + 系统目录校验。 */
 export interface PluginChatRequest {
+	/** Whether a newly created channel conversation must be opened as independent. */
+	independent?: boolean;
+	/** Validated image bytes or workspace file references. */
+	attachments?: PluginChatAttachment[];
 	/** 送给 agent 的任务文本（插件应已拼好发送者前缀、裁剪封顶）。 */
 	text: string;
 	/** 通道内的账号标识（多账号隔离：每个 accountId 独立伪客户端/会话）。 */
@@ -246,16 +257,27 @@ export interface PluginChatRequest {
 	/** 可选：绑定已有会话 ID（命中运行中对话时走 steer 语义投递，网页端实时
 	 *  可见；miss/已回收时回落无头伪客户端执行，不静默丢消息）。 */
 	conversationId?: string;
+	/** Require `conversationId` to resolve exactly; do not fall back to the
+	 *  plugin pseudo-client when it is missing or busy. Transport gateways use
+	 *  this to prevent cross-channel context leaks. */
+	strictConversationId?: boolean;
 	/** 可选：指定模型（`provider/id` 格式，投递前切换，失败即拒绝不回落）。 */
 	model?: string;
 	/** 可选：指定思考强度（投递前切换，失败即拒绝不回落）。 */
 	thinkingLevel?: string;
 }
 
+/** Backward-compatible attachment shape used by existing channel callers. */
+export type PluginChatAttachment = Omit<PromptAttachment, "path"> & { path?: string };
+
 /** host.chat 的投递回执（运行中，结论经 run_end 事件）。 */
 export interface PluginChatResult {
+	/** Stable SDK session identity for channel replies originating from other clients. */
+	sessionId?: string;
 	conversationId: string;
 	clientId: string;
+	/** Stable plugin run identity propagated to every run event. */
+	runId?: string;
 }
 /** host.conversations.list 的条目（running/history 等，kind 原样透传）。 */
 export interface PluginConversationListItem {
@@ -264,7 +286,56 @@ export interface PluginConversationListItem {
 	cwd: string;
 	kind: string;
 	isStreaming: boolean;
+	/** Persisted Pi session file, when the conversation has one.
+	 *  Transport plugins use this as the stable identity across restarts. */
+	sessionFile?: string;
 }
+
+/**
+ * Create or reopen a background conversation owned by a transport plugin.
+ *
+ * `key` is stable within one plugin (for example a Signal group ID). Reusing
+ * the key returns the same live conversation without changing the user's
+ * active chat. Supply `sessionFile` after a restart to reopen the persisted
+ * transcript instead of creating a new one.
+ */
+export interface PluginConversationEnsureRequest {
+	/** Stable, plugin-scoped identity such as `group:<id>` or `dm:<aci>`. */
+	key: string;
+	/** Human-readable title shown in the running-conversation list. */
+	title?: string;
+	/** Workspace for this conversation. Defaults to the host's current cwd. */
+	cwd?: string;
+	/** Existing pi-web-ui agent preset id. */
+	preset?: string;
+	/** Channel-specific system prompt. */
+	systemPrompt?: string;
+	/** `append` preserves the normal pi-web-ui prompt; `replace` substitutes it. */
+	systemPromptMode?: "append" | "replace";
+	/** Optional skill/include allowlists for this conversation profile. */
+	enabledSkills?: string[];
+	enabledExtensions?: string[];
+	/** Persisted Pi session file from a previous process. */
+	sessionFile?: string;
+	/** Provider/model id, using `provider/model-id`. */
+	model?: string;
+	/** SDK thinking level such as `off`, `low`, `medium`, or `high`. */
+	thinkingLevel?: string;
+}
+
+/** Result of host.conversations.ensure(). */
+export interface PluginConversationEnsureResult {
+	ok: boolean;
+	conversationId?: string;
+	sessionFile?: string;
+	error?: string;
+}
+
+/** PluginManager conversation creation hook injected by server/index.ts. */
+export type PluginConversationEnsurer = (
+	pluginId: string,
+	request: PluginConversationEnsureRequest,
+) => Promise<PluginConversationEnsureResult>;
 
 /** 插件注册的内联状态标记（Inline Marker）。 */
 export interface PluginMarkerDef<State = unknown> {
@@ -485,6 +556,9 @@ export interface PluginHost {
 			query: string,
 			limit?: number,
 		): Array<{ id: string; title: string }> | Promise<Array<{ id: string; title: string }>>;
+		/** Create or reopen a visible background conversation by stable key.
+		 *  This never switches the browser's active conversation. */
+		ensure(request: PluginConversationEnsureRequest): Promise<PluginConversationEnsureResult>;
 	};
 	/** 向指定对话发一条用户消息（经 conversationWriter 注入点；无注入回
 	 *  {ok:false}，绝不抛错）。attachments 只收工作区路径三件套。 */
@@ -2509,6 +2583,9 @@ export class PluginManager {
 				limit?: number,
 		  ) => Array<{ id: string; title: string }> | Promise<Array<{ id: string; title: string }>>)
 		| undefined = undefined;
+	/** 由 index.ts 接入 agent-service：创建/复用后台对话（host.conversations.ensure 的底层）。
+	 *  无注入回 {ok:false}，绝不抛错。 */
+	conversationEnsurer: PluginConversationEnsurer | undefined = undefined;
 	/** 由 index.ts 接入 agent-service：向指定对话发用户消息（host.prompt 的底层）。
 	 *  无注入回 {ok:false}，绝不抛错。 */
 	conversationWriter:
@@ -2546,7 +2623,7 @@ export class PluginManager {
 	/** 插件间总线订阅：topic → 处理器集合（host.events.on 注册；反激活时清理该插件全部订阅）。 */
 	readonly busHandlers = new Map<string, Set<(ev: PluginBusEvent) => void>>();
 	/** host.chatWait 的 run_end 等待者（emitRunEvent 里按 conversationId 唤醒）。 */
-	private chatWaiters: Array<{ conversationId: string; done: (ended: boolean) => void }> = [];
+	private chatWaiters: Array<{ conversationId: string; runId?: string; done: (ended: boolean) => void }> = [];
 	/** 激活期插件的能力门控快照（activate 开头写入、落盘 loaded 或失败即删）：
 	 *  canUse 在 host 对象可用之前（loaded.set 之前）也要能判定。 */
 	private activatingGates = new Map<string, GateRecord>();
@@ -2614,10 +2691,11 @@ export class PluginManager {
 	}
 
 	/** host.chatWait 等待指定对话的 run_end（默认 120s 超时由调用方钳制后传入）。 */
-	private waitRunEnd(conversationId: string, timeoutMs: number): Promise<boolean> {
+	private waitRunEnd(conversationId: string, timeoutMs: number, runId?: string): Promise<boolean> {
 		return new Promise<boolean>((resolve) => {
 			const entry = {
 				conversationId,
+				...(runId ? { runId } : {}),
 				done: (ended: boolean) => {
 					clearTimeout(timer);
 					const i = this.chatWaiters.indexOf(entry);
@@ -2680,9 +2758,11 @@ export class PluginManager {
 	 *  与 emitToolEvent 同级；订阅者崩了只记日志，不影响主流程）。
 	 *  run_end 顺带唤醒 host.chatWait 的等待者（按 conversationId 匹配）。 */
 	emitRunEvent(ev: PluginRunEvent): void {
-		if (ev.type === "run_end" && ev.conversationId) {
+		if (ev.type === "run_end" && (ev.conversationId || ev.runId)) {
 			for (const w of this.chatWaiters) {
-				if (w.conversationId !== ev.conversationId) continue;
+				const byRun = Boolean(ev.runId && w.runId && ev.runId === w.runId);
+				const byConv = Boolean(ev.conversationId) && w.conversationId === ev.conversationId && !w.runId;
+				if (!byRun && !byConv) continue;
 				try {
 					w.done(true);
 				} catch (err) {
@@ -4021,26 +4101,36 @@ export class PluginManager {
 		const canWrite = (): boolean => self.canUse(info.id, "fs:write");
 		/** 无头调用落地（host.chat 与 host.chatWait 共用）：能力 "chat" 门控 +
 		 *  文本校验 + chatProvider 投递。宿主未接入时拒绝（不抛到插件侧，由调用方包 {ok:false}）。 */
-		const sendChat = (req: PluginChatRequest): Promise<PluginChatResult> => {
+		const sendChat = async (req: PluginChatRequest): Promise<PluginChatResult> => {
 			if (!can("chat")) return Promise.reject(new Error(`插件未声明能力 "chat"（manifest.permissions）——请求被拒`));
 			if (!self.chatProvider) {
 				return Promise.reject(new Error("宿主未提供无头调用（chatProvider 未接入）——请升级 pi-web-ui"));
 			}
 			const text = String((req as PluginChatRequest | undefined)?.text ?? "").trim();
-			if (!text) return Promise.reject(new Error("chat: text 为空"));
-			if (text.length > 8000) return Promise.reject(new Error("chat: text 超长（>8000 字），请裁剪后重发"));
-			const accountId = String((req as PluginChatRequest | undefined)?.accountId ?? "default").slice(0, 64);
-			// issue #226：透传定时任务对齐的四件套（各按长度封顶，语义校验归宿主 chatFromPlugin）。
 			const r = ((req as PluginChatRequest | undefined) ?? {}) as PluginChatRequest;
+			let attachments: PromptAttachment[] | undefined;
+			try {
+				attachments = normalizePluginChatAttachments(r.attachments);
+			} catch (err) {
+				return Promise.reject(err);
+			}
+			if (!text && !attachments?.length) {
+				return Promise.reject(new Error("chat: text and attachments are both empty"));
+			}
+			if (text.length > 8000) return Promise.reject(new Error("chat: text 超长（>8000 字），请裁剪后重发"));
+			const accountId = String(r.accountId ?? "default").slice(0, 64);
 			const passthrough: PluginChatRequest = { text, accountId };
 			const cwd = String(r.cwd ?? "").trim();
 			if (cwd) passthrough.cwd = cwd.slice(0, 1024);
 			const conversationId = String(r.conversationId ?? "").trim();
 			if (conversationId) passthrough.conversationId = conversationId.slice(0, 128);
+			if (r.strictConversationId === true) passthrough.strictConversationId = true;
+			if (r.independent === true) passthrough.independent = true;
 			const model = String(r.model ?? "").trim();
 			if (model) passthrough.model = model.slice(0, 256);
 			const thinkingLevel = String(r.thinkingLevel ?? "").trim();
 			if (thinkingLevel) passthrough.thinkingLevel = thinkingLevel.slice(0, 64);
+			if (attachments?.length) passthrough.attachments = attachments;
 			return self.chatProvider(info.id, passthrough);
 		};
 		let pluginAbort: AbortController | null = null;
@@ -4108,7 +4198,7 @@ export class PluginManager {
 					if (!cid) return { ok: false, error: "无头调用未返回 conversationId" };
 					// 默认 120s 超时；上下钳制防 100ms 误杀与无限等待。
 					const timeoutMs = Math.max(1000, Math.min(Number(opts?.timeoutMs ?? 120_000) || 120_000, 600_000));
-					const ended = await self.waitRunEnd(cid, timeoutMs);
+					const ended = await self.waitRunEnd(cid, timeoutMs, sent?.runId);
 					if (!ended)
 						return { ok: false, conversationId: cid, error: `等待运行结束超时（约${Math.round(timeoutMs / 1000)}s）` };
 					return { ok: true, conversationId: cid };
@@ -4239,6 +4329,50 @@ export class PluginManager {
 						return pick(all ?? []);
 					} catch {
 						return [];
+					}
+				},
+				ensure: async (request) => {
+					try {
+						if (!can("chat")) return { ok: false, error: `插件未声明能力 "chat"（manifest.permissions）——请求被拒` };
+						if (!self.conversationEnsurer) {
+							return { ok: false, error: "宿主未接入对话创建（仅标准 pi 引擎支持）" };
+						}
+						const key = String(request?.key ?? "").trim();
+						if (!key) return { ok: false, error: "conversation key 不能为空" };
+						if (key.length > 160) return { ok: false, error: "conversation key 过长（>160 字）" };
+						const title =
+							typeof request?.title === "string" && request.title.trim()
+								? request.title.trim().slice(0, 160)
+								: undefined;
+						const prompt =
+							typeof request?.systemPrompt === "string" ? request.systemPrompt.slice(0, 32_768) : undefined;
+						const settings = Array.isArray(request?.enabledSkills) ? request.enabledSkills.slice(0, 64) : undefined;
+						const extensions = Array.isArray(request?.enabledExtensions)
+							? request.enabledExtensions.slice(0, 64)
+							: undefined;
+						return await self.conversationEnsurer(info.id, {
+							key,
+							...(title ? { title } : {}),
+							...(typeof request?.cwd === "string" && request.cwd.trim() ? { cwd: request.cwd.trim() } : {}),
+							...(typeof request?.preset === "string" && request.preset.trim()
+								? { preset: request.preset.trim() }
+								: {}),
+							...(prompt !== undefined ? { systemPrompt: prompt } : {}),
+							...(request?.systemPromptMode === "replace"
+								? { systemPromptMode: "replace" }
+								: { systemPromptMode: "append" }),
+							...(settings ? { enabledSkills: settings.filter((v) => typeof v === "string") } : {}),
+							...(extensions ? { enabledExtensions: extensions.filter((v) => typeof v === "string") } : {}),
+							...(typeof request?.sessionFile === "string" && request.sessionFile.trim()
+								? { sessionFile: request.sessionFile.trim() }
+								: {}),
+							...(typeof request?.model === "string" && request.model.trim() ? { model: request.model.trim() } : {}),
+							...(typeof request?.thinkingLevel === "string" && request.thinkingLevel.trim()
+								? { thinkingLevel: request.thinkingLevel.trim() }
+								: {}),
+						});
+					} catch (err) {
+						return { ok: false, error: (err as Error).message };
 					}
 				},
 			},

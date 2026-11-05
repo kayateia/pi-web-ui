@@ -2551,6 +2551,12 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 	type PluginSearchClient = {
 		searchForPlugins?: (q: string, n?: number) => Promise<{ id: string; title: string }[]>;
 	};
+	type PluginEnsureClient = {
+		ensureConversationForPlugins?: (
+			pluginId: string,
+			spec: import("./plugins.js").PluginConversationEnsureRequest,
+		) => Promise<import("./plugins.js").PluginConversationEnsureResult>;
+	};
 	type PluginWriteClient = {
 		writeForPlugins?: (cid: string, t: string) => Promise<{ ok: boolean; error?: string }>;
 	};
@@ -2594,6 +2600,22 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 			return [];
 		}
 	};
+	// conversationEnsurer：创建/复用不带焦点的后台对话。Signal 等外部通道用稳定
+	// channel key 绑定普通 pi-web-ui 对话，并可按通道配置系统提示词。
+	(pm as any).conversationEnsurer = async (
+		pluginId: string,
+		spec: import("./plugins.js").PluginConversationEnsureRequest,
+	) => {
+		try {
+			const cs = pickClient() as PluginEnsureClient | undefined;
+			if (!cs || typeof cs.ensureConversationForPlugins !== "function") {
+				return { ok: false, error: "当前引擎不支持创建插件对话（仅标准 pi 引擎）" };
+			}
+			return await cs.ensureConversationForPlugins(pluginId, spec);
+		} catch (err) {
+			return { ok: false, error: (err as Error).message };
+		}
+	};
 	// conversationWriter：向指定对话投递 prompt（复用 prompt 路径）；找不到对话回 {ok:false,error}。
 	(pm as any).conversationWriter = async (id: string, text: string) => {
 		try {
@@ -2629,6 +2651,10 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 	// runAborter：有现成 abort 路径（interruptRun，卡住/空转强制重置语义继承）。
 	(pm as any).runAborter = async (id: string) => {
 		try {
+			if (id.startsWith("pr-")) {
+				if (!piServiceInstance) return { ok: false, error: "not supported" };
+				return await piServiceInstance.abortPluginRun(id);
+			}
 			const cs = pickClient() as PluginAbortClient | undefined;
 			if (!cs || typeof cs.abortForPlugins !== "function") return { ok: false, error: "not supported" };
 			return await cs.abortForPlugins(id);

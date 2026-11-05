@@ -310,6 +310,7 @@ export function createMockHost(overrides) {
 			list: () => [],
 			get: () => null,
 			search: () => [],
+			ensure: async () => okFalse("conversationEnsurer（后台对话创建未接入）"),
 		},
 		prompt: async () => okFalse("conversationWriter（对话写入未接入）"),
 		steer: async () => okFalse("runSteerer（运行插队未接入）"),
