@@ -1039,7 +1039,8 @@ export class SignalGateway {
 		if (!pending) return;
 
 		if (event.type === "run_start") {
-			if (event.task && event.task !== pending.expectedTask) {
+			const stableMatch = Boolean(event.runId && pending.runId && event.runId === pending.runId);
+			if (!stableMatch && event.task && event.task !== String(pending.expectedTask).slice(0, 500)) {
 				if (pending.timeout) clearTimeout(pending.timeout);
 				this.deletePendingRun(pending);
 			}
