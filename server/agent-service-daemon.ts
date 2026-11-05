@@ -669,14 +669,43 @@ export class AgentService {
 		// miss/已回收时不抛错，回落无头伪客户端（浏览器关着时微信照常可用）。
 		const target = String(req?.conversationId ?? "").trim();
 		if (target) {
-			const w = await this.wakeConversation(target, text, { attachments });
-			if (w.ok) return { conversationId: target, clientId: w.clientId ?? clientId };
-			if (req?.strictConversationId === true) {
-				throw new Error(
-					w.busy
-						? `目标对话正忙，拒绝回落到其他会话：${w.error ?? target}`
-						: `目标对话不可用，拒绝回落到其他会话：${w.error ?? target}`,
-				);
+			// Conversation ids are local to a client. Prefer this channel's own
+			// client. The durable SDK session id disambiguates restored clients
+			// whose local counters reuse the same conversation id.
+			const targetSessionId = String(req?.sessionId ?? "").trim();
+			const matchesTarget = (conv: Conversation) =>
+				!targetSessionId || String(conv.session.sessionId ?? "") === targetSessionId;
+			const own = this.clients.get(clientId);
+			const ownConv = own?.getConversation(target);
+			const hits: { owner: ClientSession; conv: Conversation; ownerId: string }[] = [];
+			if (own && ownConv && matchesTarget(ownConv)) hits.push({ owner: own, conv: ownConv, ownerId: clientId });
+			else {
+				for (const [ownerId, owner] of this.clients) {
+					const conv = owner.getConversation(target);
+					if (conv && matchesTarget(conv)) hits.push({ owner, conv, ownerId });
+				}
+			}
+			if (hits.length > 1) throw new Error("chatFromPlugin: ambiguous conversation id; rebind the channel");
+			if (hits.length === 1) {
+				const { owner, conv, ownerId } = hits[0];
+				if (req.cwd && resolve(req.cwd) !== resolve(conv.cwd))
+					throw new Error("chatFromPlugin: bound conversation cwd differs; start a new channel conversation");
+				if (req.model || req.thinkingLevel) {
+					// Apply overrides only when the captured conversation is active;
+					// these APIs address the owner's active conversation.
+					if (owner.readConversationForPlugins()?.conversationId !== conv.id)
+						throw new Error("chatFromPlugin: cannot change settings of an inactive bound conversation");
+					if (req.model) await owner.switchModelOrThrow(req.model);
+					if (req.thinkingLevel) owner.setThinking(req.thinkingLevel);
+				}
+				owner.markPluginRun(runId, conv);
+				void owner
+					.prompt(text, attachments, false, conv)
+					.catch((err) => console.error("[plugin chat] prompt failed", err));
+				return { conversationId: conv.id, clientId: ownerId, sessionId: conv.session.sessionId, runId };
+			}
+			if (req.strictConversationId === true) {
+				throw new Error(`目标对话不可用，拒绝回落到其他会话：${target}`);
 			}
 		}
 		if (req?.strictConversationId === true) throw new Error("strictConversationId 需要有效的 conversationId");

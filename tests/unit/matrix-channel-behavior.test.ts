@@ -1,0 +1,334 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolve } from "node:path";
+import activate, { MatrixBotBridge } from "../../plugins/matrix/index.mjs";
+
+const cfg = { homeserverUrl: "https://matrix.test", accessToken: "token" };
+afterEach(() => vi.unstubAllGlobals());
+function setup(chat?: any) {
+	const sent: any[] = [];
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async (url: string, init: any = {}) => {
+			if (url.includes("/media/download/")) return new Response(new Uint8Array([1, 2, 3]));
+			if (url.includes("/upload")) return Response.json({ content_uri: "mxc://matrix.test/upload" });
+			if (init.body) sent.push(JSON.parse(init.body));
+			return Response.json(url.endsWith("/state") ? [] : { event_id: "$sent" });
+		}),
+	);
+	const host = {
+		cwd: process.cwd(),
+		chat: chat || vi.fn(async () => ({ conversationId: "actual", runId: "stable" })),
+		abortRun: vi.fn(async () => ({ ok: true })),
+		models: { list: vi.fn(async () => [{ provider: "test", id: "model" }]) },
+		fs: {
+			mkdirPath: vi.fn(),
+			writePath: vi.fn(),
+			statPath: vi.fn(async () => ({ type: "dir", size: 3 })),
+			readPath: vi.fn(async () => Buffer.from([1, 2, 3])),
+		},
+	};
+	const bridge = new MatrixBotBridge({ host, getConfig: () => cfg, log: vi.fn() });
+	const inbound = (body: string, content: any = {}, room = "!room", thread = "$thread", sender = "@user:test") =>
+		bridge.onInboundMessage(room, {
+			event_id: Math.random().toString(),
+			sender,
+			content: { msgtype: "m.text", body, "m.relates_to": { rel_type: "m.thread", event_id: thread }, ...content },
+		});
+	return { bridge, host, sent, inbound };
+}
+describe("Matrix channel behavior", () => {
+	it("uses the persisted pi-web-ui locale for chat-facing replies", async () => {
+		const { bridge, inbound, sent } = setup();
+		bridge.getConfig = () => ({ ...cfg, locale: "zh-TW" });
+		await inbound("/help");
+		expect(sent.at(-1).body).toContain("Matrix 机器人帮助");
+		bridge.getConfig = () => ({ ...cfg, locale: "en-US" });
+		await inbound("/help");
+		expect(sent.at(-1).body).toContain("Matrix bot help");
+	});
+
+	it("handles all commands locally and applies scoped settings", async () => {
+		const { inbound, host, sent } = setup();
+		for (const cmd of [
+			"/help",
+			"/status",
+			"/new",
+			"/clear",
+			"/stop",
+			"/abort",
+			"/model",
+			"/thinking",
+			"/cwd",
+			"/unknown",
+			"/model bad",
+			"/thinking bad",
+			"/cwd relative",
+		])
+			await inbound(cmd);
+		expect(host.chat).not.toHaveBeenCalled();
+		await inbound("/model test/model");
+		await inbound("/thinking high");
+		await inbound(`/cwd ${process.cwd()}`);
+		await inbound("hello");
+		expect(host.chat).toHaveBeenCalledWith(
+			expect.objectContaining({ model: "test/model", thinkingLevel: "high", cwd: process.cwd() }),
+		);
+		await inbound("/stop");
+		expect(host.abortRun).toHaveBeenCalledWith("stable");
+		expect(sent.some((s) => s.body.includes("Unknown command"))).toBe(true);
+	});
+	it("rotates daemon account identity for new, clear, cwd and model", async () => {
+		const { inbound, host, bridge } = setup(
+			vi.fn(async (request: any) => ({ conversationId: "c1", runId: `run:${request.accountId}` })),
+		);
+		const accounts = [];
+		await inbound("first");
+		accounts.push(host.chat.mock.calls.at(-1)[0].accountId);
+		await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1).value).runId });
+		for (const command of ["/new", "/clear", `/cwd ${process.cwd()}`, "/model test/model"]) {
+			await inbound(command);
+			await inbound("next");
+			accounts.push(host.chat.mock.calls.at(-1)[0].accountId);
+			await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1).value).runId });
+		}
+		expect(new Set(accounts).size).toBe(5);
+	});
+	it("stops a pending media download immediately and never dispatches it", async () => {
+		const { inbound, host, sent } = setup();
+		const normalFetch = globalThis.fetch;
+		let release: any;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: any, init: any) => {
+				if (String(url).includes("/media/download/"))
+					return await new Promise<Response>((done) => {
+						release = () => done(new Response(new Uint8Array([1])));
+					});
+				return normalFetch(url, init);
+			}),
+		);
+		const pending = inbound("image", {
+			msgtype: "m.image",
+			url: "mxc://matrix.test/image",
+			info: { mimetype: "image/png" },
+		});
+		await inbound("/stop");
+		expect(sent.some((s) => s.body.includes("download cancelled"))).toBe(true);
+		release();
+		await pending;
+		expect(host.chat).not.toHaveBeenCalled();
+		expect(host.fs.writePath).not.toHaveBeenCalled();
+	});
+	it("claims multiple early messages and run_end by stable runId despite renamed conversation IDs", async () => {
+		let bridge: any;
+		const chat = vi.fn(async () => {
+			await bridge.handleRunEvent({
+				type: "message",
+				conversationId: "early-a",
+				runId: "stable",
+				message: { role: "assistant", content: "early answer" },
+			});
+			await bridge.handleRunEvent({
+				type: "message",
+				conversationId: "early-a",
+				runId: "stable",
+				message: { role: "assistant", content: "later answer" },
+			});
+			await bridge.handleRunEvent({ type: "run_end", conversationId: "early-b", runId: "stable" });
+			return { conversationId: "real", runId: "stable" };
+		});
+		const result = setup(chat);
+		bridge = result.bridge;
+		await result.inbound("hello");
+		expect([...bridge.userConversations.values()]).toEqual(["real"]);
+		expect(bridge.pendingRuns.size).toBe(0);
+		expect(result.sent.filter((s) => s.body === "early answer\n\n--\n\nlater answer")).toHaveLength(1);
+		expect(result.sent.at(-1)["m.relates_to"]).toEqual({ rel_type: "m.thread", event_id: "$thread" });
+	});
+	it("preserves early terminal state after many assistant events and marks partial aborts", async () => {
+		let bridge: any;
+		const result = setup(
+			vi.fn(async () => {
+				for (let i = 0; i < 300; i++)
+					await bridge.handleRunEvent({
+						type: "message",
+						runId: "flood",
+						conversationId: "early",
+						message: { role: "assistant", content: "partial" },
+					});
+				await bridge.handleRunEvent({
+					type: "run_end",
+					runId: "flood",
+					conversationId: "changed",
+					stopReason: "aborted",
+				});
+				return { conversationId: "actual", runId: "flood" };
+			}),
+		);
+		bridge = result.bridge;
+		await result.inbound("hello");
+		expect(bridge.pendingRuns.size).toBe(0);
+		expect(result.sent.some((s) => s.body.includes("partial") && s.body.includes("Task stopped"))).toBe(true);
+	});
+	it("uses one channel identity per room across users and threads", async () => {
+		let n = 0;
+		const { inbound, bridge, host, sent } = setup(
+			vi.fn(async () => ({ conversationId: `real${++n}`, runId: `run${n}` })),
+		);
+		await inbound("a");
+		await bridge.handleRunEvent({ type: "run_end", runId: "run1" });
+		sent.length = 0;
+		await inbound("b", {}, "!other");
+		await inbound("c", {}, "!room", "$other");
+		expect(new Set(host.chat.mock.calls.map((c: any) => c[0].accountId)).size).toBe(2);
+		expect(host.chat.mock.calls[0][0].accountId).toBe(host.chat.mock.calls[2][0].accountId);
+		await bridge.handleRunEvent({ type: "run_end", runId: "unrelated", conversationId: "real1" });
+		expect(sent).toHaveLength(0);
+		await bridge.handleRunEvent({
+			type: "message",
+			runId: "run2",
+			conversationId: "renamed",
+			message: { role: "assistant", content: "answer" },
+		});
+		await bridge.handleRunEvent({ type: "run_end", runId: "run2", conversationId: "renamed-again" });
+		expect(sent.at(-1).body).toBe("answer");
+	});
+	it("shares one conversation and sender attribution per room", async () => {
+		const { bridge, inbound, host } = setup();
+		await inbound("from alice", {}, "!room", "$thread-a", "@alice:matrix.org");
+		await bridge.handleRunEvent({
+			type: "message",
+			runId: "stable",
+			message: { role: "assistant", content: "first" },
+		});
+		await bridge.handleRunEvent({ type: "run_end", runId: "stable" });
+		await inbound("from bob", {}, "!room", "$thread-b", "@bob:matrix.org");
+		expect(host.chat).toHaveBeenCalledTimes(2);
+		expect(host.chat.mock.calls[0][0].accountId).toBe(host.chat.mock.calls[1][0].accountId);
+		expect(host.chat.mock.calls[1][0].text).toBe("[Matrix channel !room · sender @bob:matrix.org]: from bob");
+		expect(bridge.userConversations.size).toBe(1);
+	});
+	it("queues messages per room without sending a busy warning", async () => {
+		let releaseFirst!: (value: any) => void;
+		const { bridge, inbound, host, sent } = setup(
+			vi
+				.fn()
+				.mockImplementationOnce(
+					() =>
+						new Promise((resolve) => {
+							releaseFirst = resolve;
+						}),
+				)
+				.mockImplementationOnce(async () => ({ conversationId: "actual", runId: "second-run" })),
+		);
+		const first = inbound("first");
+		await vi.waitFor(() => expect(host.chat).toHaveBeenCalledTimes(1));
+		const second = inbound("second");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(host.chat).toHaveBeenCalledTimes(1);
+		releaseFirst({ conversationId: "actual", runId: "first-run" });
+		await first;
+		await bridge.handleRunEvent({
+			type: "message",
+			runId: "first-run",
+			message: { role: "assistant", content: "first answer" },
+		});
+		await bridge.handleRunEvent({ type: "run_end", runId: "first-run" });
+		await second;
+		expect(host.chat).toHaveBeenCalledTimes(2);
+		expect(host.chat.mock.calls[1][0].text).toBe("[Matrix channel !room · sender @user:test]: second");
+		expect(sent.filter((message) => message.body === "first answer")).toHaveLength(1);
+		expect(sent.some((message) => String(message.body).includes("running"))).toBe(false);
+		expect(sent.some((message) => String(message.body).includes("仍在运行"))).toBe(false);
+		await bridge.handleRunEvent({ type: "run_end", runId: "second-run" });
+	});
+	it.each(["image", "audio", "file", "video"])("downloads %s and passes real attachments to chat", async (type) => {
+		const { inbound, host, sent } = setup();
+		await inbound("example", {
+			msgtype: `m.${type}`,
+			url: "mxc://matrix.test/media",
+			info: { mimetype: type === "image" ? "image/png" : "application/octet-stream" },
+		});
+		expect(host.fs.writePath).toHaveBeenCalledWith(expect.stringContaining(".matrix-media"), Buffer.from([1, 2, 3]));
+		expect(host.chat.mock.calls[0][0].text).toBe(`[Matrix channel !room · sender @user:test]: example`);
+		expect(sent).toHaveLength(0);
+		const attachment = host.chat.mock.calls[0][0].attachments[0];
+		if (type === "image")
+			expect(attachment).toEqual({ path: "", imageData: "AQID", mimeType: "image/png", name: "example" });
+		else
+			expect(attachment).toEqual({
+				path: expect.stringContaining(".matrix-media"),
+				mode: "reference",
+				name: "example",
+			});
+	});
+	it("reports download, encrypted attachment and unknown type failures without dispatch", async () => {
+		const { inbound, host, sent } = setup();
+		await inbound("bad", { msgtype: "m.image", file: { url: "mxc://encrypted" } });
+		await inbound("bad", { msgtype: "m.video" });
+		await inbound("bad", { msgtype: "m.unknown" });
+		expect(host.chat).not.toHaveBeenCalled();
+		expect(sent.every((s) => s.body.startsWith("❌"))).toBe(true);
+	});
+	it("reports oversize images and file write failures without dispatch", async () => {
+		const { inbound, host, sent } = setup();
+		const normalFetch = globalThis.fetch;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: any, init: any) =>
+				String(url).includes("/media/download/")
+					? new Response("", { headers: { "content-length": String(11 * 1024 * 1024) } })
+					: normalFetch(url, init),
+			),
+		);
+		await inbound("large", { msgtype: "m.image", url: "mxc://matrix.test/image", info: { mimetype: "image/png" } });
+		expect(host.fs.writePath).not.toHaveBeenCalled();
+		expect(sent.at(-1).body).toContain("10 MiB");
+		vi.stubGlobal("fetch", normalFetch);
+		host.fs.writePath.mockRejectedValueOnce(new Error("disk full"));
+		await inbound("file", { msgtype: "m.file", url: "mxc://matrix.test/file" });
+		expect(host.chat).not.toHaveBeenCalled();
+		expect(sent.at(-1).body).toContain("disk full");
+	});
+	it("rejects E2EE outbound and exposes reply delivery failures", async () => {
+		const { bridge } = setup();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json([{ type: "m.room.encryption" }])),
+		);
+		await expect(bridge.sendRoomMessage("!encrypted", "secret")).rejects.toThrow("E2EE");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("network down");
+			}),
+		);
+		await bridge.feedback("!other", "reply");
+		expect(bridge.status.lastError).toContain("https://matrix.test");
+		expect(bridge.status.lastError).toContain("network down");
+	});
+	it("uploads and sends every media type through the registered tool", async () => {
+		const { host, sent } = setup();
+		let tool: any;
+		const deactivate = await activate({
+			...host,
+			storage: { get: () => cfg },
+			registerTool: (t: any) => {
+				tool = t;
+			},
+		});
+		for (const type of ["image", "audio", "file", "video"])
+			await tool.execute({
+				action: "send",
+				room_id: "!room",
+				path: resolve(process.cwd(), "example.bin"),
+				media_type: type,
+			});
+		expect(sent.map((s) => s.msgtype)).toEqual(["m.image", "m.audio", "m.file", "m.video"]);
+		expect(sent.every((s) => s.url === "mxc://matrix.test/upload")).toBe(true);
+		await expect(tool.execute({ action: "send", room_id: "!room", path: "../outside" })).rejects.toThrow(
+			"inside workspace",
+		);
+		await deactivate();
+	});
+});
