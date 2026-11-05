@@ -2651,6 +2651,10 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 	// runAborter：有现成 abort 路径（interruptRun，卡住/空转强制重置语义继承）。
 	(pm as any).runAborter = async (id: string) => {
 		try {
+			if (id.startsWith("pr-")) {
+				if (!piServiceInstance) return { ok: false, error: "not supported" };
+				return await piServiceInstance.abortPluginRun(id);
+			}
 			const cs = pickClient() as PluginAbortClient | undefined;
 			if (!cs || typeof cs.abortForPlugins !== "function") return { ok: false, error: "not supported" };
 			return await cs.abortForPlugins(id);

@@ -145,7 +145,9 @@ describe("host.chat 四件套透传（issue #226）", () => {
 			strictConversationId: true,
 			attachments: [{ name: "photo.png", mimeType: "image/png", imageData }],
 		});
-		expect(got?.attachments).toEqual([{ name: "photo.png", mimeType: "image/png", imageData }]);
+		expect(got?.attachments).toEqual([
+			{ path: "", name: "photo.png", mimeType: "image/png", imageData, size: 14 },
+		]);
 	});
 	it("rejects unsupported image attachment types", async () => {
 		makeChatter("badimage", ["chat"]);
@@ -156,7 +158,7 @@ describe("host.chat 四件套透传（issue #226）", () => {
 				text: "image",
 				attachments: [{ mimeType: "text/html", imageData: "PGgxPg==" }],
 			}),
-		).rejects.toThrow(/unsupported image MIME/);
+		).rejects.toThrow(/image MIME/);
 	});
 	it("不传四件套时只发 text+accountId（老插件语义不变）", async () => {
 		makeChatter("chatter", ["chat"]);

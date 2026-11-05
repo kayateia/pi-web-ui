@@ -14,6 +14,7 @@
  */
 import { join, resolve } from "node:path";
 import { statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { VERSION, getAgentDir, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { ClientStateStore } from "./client-state.js";
 import { ClaimStore } from "./claim-store.js";
@@ -25,6 +26,7 @@ import { isRemoteWorkspaceUri, resolveWorkspaceSessionDir } from "./remote-ssh-s
 import { getMaxOpenConversations } from "./agent-formatters.js";
 import { collectSubagentDescendantIds } from "./subagents.js";
 import { pickLatestClientSnapshot } from "./plugin-conversation-view.js";
+import { normalizePluginChatAttachments } from "./plugin-chat-attachments.js";
 import type { ToolGuardHook } from "./tool-guards.js";
 import type {
 	ServerMessage,
@@ -60,21 +62,33 @@ import {
 
 /** Convert validated plugin images into SDK prompt image blocks. */
 function pluginImages(attachments: PluginChatAttachment[] | undefined) {
-	return (attachments ?? []).map((attachment) => ({
-		type: "image" as const,
-		data: attachment.imageData,
-		mimeType: attachment.mimeType || "image/png",
-	}));
+	return (attachments ?? []).flatMap((attachment) =>
+		attachment.imageData
+			? [
+					{
+						type: "image" as const,
+						data: attachment.imageData,
+						mimeType: attachment.mimeType || "image/png",
+					},
+				]
+			: [],
+	);
 }
 
 /** Convert plugin images into the normal attachment pipeline's image shape. */
 function pluginPromptAttachments(attachments: PluginChatAttachment[] | undefined): PromptAttachment[] {
-	return (attachments ?? []).map((attachment) => ({
-		path: "",
-		imageData: attachment.imageData,
-		mimeType: attachment.mimeType || "image/png",
-		name: attachment.name || "Signal image",
-	}));
+	return (attachments ?? []).flatMap((attachment) =>
+		attachment.imageData
+			? [
+					{
+						path: "",
+						imageData: attachment.imageData,
+						mimeType: attachment.mimeType || "image/png",
+						name: attachment.name || "Signal image",
+					},
+				]
+			: [],
+	);
 }
 
 export class AgentService {
@@ -647,9 +661,10 @@ export class AgentService {
 		const acct = String(req?.accountId ?? "default").replace(/[^A-Za-z0-9_-]/g, "") || "default";
 		const clientId = `plugin:${safe}:${acct}`;
 		const text = String(req?.text ?? "");
-		const attachments = Array.isArray(req?.attachments) ? req.attachments : [];
-		if (!text.trim() && attachments.length === 0) throw new Error("chatFromPlugin: text and attachments are empty");
+		const attachments = normalizePluginChatAttachments(req?.attachments);
+		if (!text.trim() && !attachments?.length) throw new Error("chatFromPlugin: text and attachments are empty");
 		if (this.quiesced) throw new QuiesceRejectedError("插件无头调用被拒绝，请等服务器恢复后重试");
+		const runId = `pr-${randomUUID()}`;
 		// 1. 绑定已有会话：steer 语义投递，网页端实时可见（微信当远程遥控器用）。
 		// miss/已回收时不抛错，回落无头伪客户端（浏览器关着时微信照常可用）。
 		const target = String(req?.conversationId ?? "").trim();
@@ -674,6 +689,7 @@ export class AgentService {
 			cwdAbs = chk.abs ?? "";
 		}
 		const cs = await this.attach(clientId, () => {});
+		cs.setConversationIndependent(cs.readConversationForPlugins()!.conversationId, req.independent ?? false);
 		try {
 			if (cwdAbs && cs.cwd !== cwdAbs) await cs.setCwd(cwdAbs);
 		} catch (err) {
@@ -695,9 +711,24 @@ export class AgentService {
 				throw new Error(`chatFromPlugin: 切换思考强度失败（${thinking}）：${(err as Error).message}`);
 			}
 		}
-		const conversationId = cs.readConversationForPlugins()?.conversationId ?? "";
-		void cs.prompt(text, pluginPromptAttachments(attachments));
-		return { conversationId, clientId };
+		let stampedId = "";
+		try {
+			stampedId = cs.markPluginRun(runId);
+		} catch {
+			/* best effort */
+		}
+		const conversationId = stampedId || (cs.readConversationForPlugins()?.conversationId ?? "");
+		const conv = cs.getConversation(conversationId);
+		void cs.prompt(text, attachments, false, conv).catch((err) => console.error("[plugin chat] prompt failed", err));
+		return { conversationId, clientId, sessionId: conv?.session.sessionId, runId };
+	}
+
+	/** Abort by stable plugin run token, including after conversation takeover. */
+	async abortPluginRun(runId: string): Promise<{ ok: boolean; error?: string }> {
+		for (const owner of this.clients.values()) {
+			if (owner.findPluginRun(runId)) return owner.abortPluginRun(runId);
+		}
+		return { ok: false, error: "Plugin run is no longer active" };
 	}
 
 	/** 内置定时任务的无头执行（issue #184，server/scheduler-tasks.ts 的 executor）。

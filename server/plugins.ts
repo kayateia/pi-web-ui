@@ -70,6 +70,7 @@ import { normalizeIconSvg } from "./icon-svg.js";
 import { PluginDomConsent, declarationWantsDom } from "./plugin-dom.js";
 import { validatePluginManifest, formatManifestIssue, isKnownPermission } from "./plugin-manifest-validate.js";
 import { buildPluginApiCatalog } from "./plugin-api-catalog.js";
+import { normalizePluginChatAttachments } from "./plugin-chat-attachments.js";
 import { AGENT_TOOL_CATALOG } from "./tool-manager.js";
 import {
 	applyPostEdit,
@@ -103,7 +104,7 @@ import {
 	type McpInstallResult,
 } from "./mcp-manager.js";
 import type { McpBridge } from "./mcp-bridge.js";
-import type { UiMcpServer } from "./protocol.js";
+import type { PromptAttachment, UiMcpServer } from "./protocol.js";
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -205,10 +206,16 @@ export interface PluginConversationSnapshot {
  * 文件改动 → 产出结果」聚成时间线；payload 全部截断封顶，可直接存/广播。
  */
 export interface PluginRunEvent {
+	/** Stable SDK session identity, retained across viewer changes and ownership transfer. */
+	sessionId?: string;
 	type:
 		"run_start" | "run_end" | "turn_start" | "turn_end" | "turn_first_token" | "message" | "tool_start" | "tool_end";
 	/** 事件所属对话。 */
 	conversationId?: string;
+	/** Event source client id; unstable across ownership transfer. */
+	clientId?: string;
+	/** Stable id for the plugin-driven run, retained across transfer and id renames. */
+	runId?: string;
 	/** 事件毫秒时间戳（服务端时钟）。 */
 	at: number;
 	/** run_start：触发本轮的用户任务文本（截断 500 字；steer 等内部续跑为空）。 */
@@ -236,6 +243,10 @@ export interface PluginRunEvent {
  *  issue #226：对齐定时任务（chatFromScheduler）的四件套——cwd 不传时回落
  *  该伪客户端当前目录（首次即宿主启动目录），传了则做存在性 + 系统目录校验。 */
 export interface PluginChatRequest {
+	/** Whether a newly created channel conversation must be opened as independent. */
+	independent?: boolean;
+	/** Validated image bytes or workspace file references. */
+	attachments?: PluginChatAttachment[];
 	/** 送给 agent 的任务文本（插件应已拼好发送者前缀、裁剪封顶）。 */
 	text: string;
 	/** 通道内的账号标识（多账号隔离：每个 accountId 独立伪客户端/会话）。 */
@@ -254,70 +265,19 @@ export interface PluginChatRequest {
 	model?: string;
 	/** 可选：指定思考强度（投递前切换，失败即拒绝不回落）。 */
 	thinkingLevel?: string;
-	/** Optional images forwarded into the mapped conversation. Raw bytes stay
-	 *  base64-encoded so plugins never expose arbitrary host file paths. */
-	attachments?: PluginChatAttachment[];
 }
 
-/** Image attachment accepted from a transport plugin. */
-export interface PluginChatAttachment {
-	/** Display filename shown in the chat transcript. */
-	name?: string;
-	/** Image MIME type, e.g. `image/jpeg`. */
-	mimeType?: string;
-	/** Base64 image bytes without a `data:` prefix. */
-	imageData: string;
-}
-
-const PLUGIN_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"]);
-const PLUGIN_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
-const PLUGIN_IMAGE_TOTAL_MAX_BYTES = 12 * 1024 * 1024;
-
-/** Validate and copy image attachments supplied by a transport plugin. */
-export function sanitizePluginChatAttachments(value: unknown): PluginChatAttachment[] {
-	if (!Array.isArray(value)) return [];
-	if (value.length > 6) throw new Error("chat: too many image attachments (max 6)");
-	const out: PluginChatAttachment[] = [];
-	let totalBytes = 0;
-	for (const entry of value) {
-		if (!entry || typeof entry !== "object") continue;
-		const raw = entry as Record<string, unknown>;
-		const mimeType = String(raw.mimeType ?? "")
-			.trim()
-			.toLowerCase();
-		if (!PLUGIN_IMAGE_MIME.has(mimeType))
-			throw new Error(`chat: unsupported image MIME type: ${mimeType || "(missing)"}`);
-		const imageData = String(raw.imageData ?? "")
-			.replace(/^data:[^;]+;base64,/, "")
-			.replace(/\s+/g, "");
-		if (!imageData || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
-			throw new Error("chat: image attachment is not valid base64");
-		}
-		const bytes = Buffer.byteLength(imageData, "base64");
-		if (bytes <= 0) throw new Error("chat: image attachment is empty");
-		if (bytes > PLUGIN_IMAGE_MAX_BYTES) throw new Error("chat: image attachment exceeds the 5 MiB limit");
-		totalBytes += bytes;
-		if (totalBytes > PLUGIN_IMAGE_TOTAL_MAX_BYTES) {
-			throw new Error("chat: image attachments exceed the 12 MiB total limit");
-		}
-		const name = String(raw.name ?? "")
-			.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029]+/g, " ")
-			.replace(/\s+/g, " ")
-			.trim()
-			.slice(0, 200);
-		out.push({
-			imageData,
-			mimeType,
-			...(name ? { name } : {}),
-		});
-	}
-	return out;
-}
+/** Backward-compatible attachment shape used by existing channel callers. */
+export type PluginChatAttachment = Omit<PromptAttachment, "path"> & { path?: string };
 
 /** host.chat 的投递回执（运行中，结论经 run_end 事件）。 */
 export interface PluginChatResult {
+	/** Stable SDK session identity for channel replies originating from other clients. */
+	sessionId?: string;
 	conversationId: string;
 	clientId: string;
+	/** Stable plugin run identity propagated to every run event. */
+	runId?: string;
 }
 /** host.conversations.list 的条目（running/history 等，kind 原样透传）。 */
 export interface PluginConversationListItem {
@@ -2663,7 +2623,7 @@ export class PluginManager {
 	/** 插件间总线订阅：topic → 处理器集合（host.events.on 注册；反激活时清理该插件全部订阅）。 */
 	readonly busHandlers = new Map<string, Set<(ev: PluginBusEvent) => void>>();
 	/** host.chatWait 的 run_end 等待者（emitRunEvent 里按 conversationId 唤醒）。 */
-	private chatWaiters: Array<{ conversationId: string; done: (ended: boolean) => void }> = [];
+	private chatWaiters: Array<{ conversationId: string; runId?: string; done: (ended: boolean) => void }> = [];
 	/** 激活期插件的能力门控快照（activate 开头写入、落盘 loaded 或失败即删）：
 	 *  canUse 在 host 对象可用之前（loaded.set 之前）也要能判定。 */
 	private activatingGates = new Map<string, GateRecord>();
@@ -2731,10 +2691,11 @@ export class PluginManager {
 	}
 
 	/** host.chatWait 等待指定对话的 run_end（默认 120s 超时由调用方钳制后传入）。 */
-	private waitRunEnd(conversationId: string, timeoutMs: number): Promise<boolean> {
+	private waitRunEnd(conversationId: string, timeoutMs: number, runId?: string): Promise<boolean> {
 		return new Promise<boolean>((resolve) => {
 			const entry = {
 				conversationId,
+				...(runId ? { runId } : {}),
 				done: (ended: boolean) => {
 					clearTimeout(timer);
 					const i = this.chatWaiters.indexOf(entry);
@@ -2797,9 +2758,11 @@ export class PluginManager {
 	 *  与 emitToolEvent 同级；订阅者崩了只记日志，不影响主流程）。
 	 *  run_end 顺带唤醒 host.chatWait 的等待者（按 conversationId 匹配）。 */
 	emitRunEvent(ev: PluginRunEvent): void {
-		if (ev.type === "run_end" && ev.conversationId) {
+		if (ev.type === "run_end" && (ev.conversationId || ev.runId)) {
 			for (const w of this.chatWaiters) {
-				if (w.conversationId !== ev.conversationId) continue;
+				const byRun = Boolean(ev.runId && w.runId && ev.runId === w.runId);
+				const byConv = Boolean(ev.conversationId) && w.conversationId === ev.conversationId && !w.runId;
+				if (!byRun && !byConv) continue;
 				try {
 					w.done(true);
 				} catch (err) {
@@ -4145,8 +4108,13 @@ export class PluginManager {
 			}
 			const text = String((req as PluginChatRequest | undefined)?.text ?? "").trim();
 			const r = ((req as PluginChatRequest | undefined) ?? {}) as PluginChatRequest;
-			const attachments = sanitizePluginChatAttachments(r.attachments);
-			if (!text && attachments.length === 0) {
+			let attachments: PromptAttachment[] | undefined;
+			try {
+				attachments = normalizePluginChatAttachments(r.attachments);
+			} catch (err) {
+				return Promise.reject(err);
+			}
+			if (!text && !attachments?.length) {
 				return Promise.reject(new Error("chat: text and attachments are both empty"));
 			}
 			if (text.length > 8000) return Promise.reject(new Error("chat: text 超长（>8000 字），请裁剪后重发"));
@@ -4157,11 +4125,12 @@ export class PluginManager {
 			const conversationId = String(r.conversationId ?? "").trim();
 			if (conversationId) passthrough.conversationId = conversationId.slice(0, 128);
 			if (r.strictConversationId === true) passthrough.strictConversationId = true;
+			if (r.independent === true) passthrough.independent = true;
 			const model = String(r.model ?? "").trim();
 			if (model) passthrough.model = model.slice(0, 256);
 			const thinkingLevel = String(r.thinkingLevel ?? "").trim();
 			if (thinkingLevel) passthrough.thinkingLevel = thinkingLevel.slice(0, 64);
-			if (attachments.length > 0) passthrough.attachments = attachments;
+			if (attachments?.length) passthrough.attachments = attachments;
 			return self.chatProvider(info.id, passthrough);
 		};
 		let pluginAbort: AbortController | null = null;
@@ -4229,7 +4198,7 @@ export class PluginManager {
 					if (!cid) return { ok: false, error: "无头调用未返回 conversationId" };
 					// 默认 120s 超时；上下钳制防 100ms 误杀与无限等待。
 					const timeoutMs = Math.max(1000, Math.min(Number(opts?.timeoutMs ?? 120_000) || 120_000, 600_000));
-					const ended = await self.waitRunEnd(cid, timeoutMs);
+					const ended = await self.waitRunEnd(cid, timeoutMs, sent?.runId);
 					if (!ended)
 						return { ok: false, conversationId: cid, error: `等待运行结束超时（约${Math.round(timeoutMs / 1000)}s）` };
 					return { ok: true, conversationId: cid };

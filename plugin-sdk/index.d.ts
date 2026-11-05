@@ -184,16 +184,10 @@ export interface PluginConversationEnsureRequest {
 export interface PluginConversationEnsureResult {
 	ok: boolean;
 	conversationId?: string;
+	/** Stable SDK session identity for later host.chat targeting. */
+	sessionId?: string;
 	sessionFile?: string;
 	error?: string;
-}
-
-/** Image attachment forwarded into a mapped conversation. */
-export interface PluginChatAttachment {
-	name?: string;
-	mimeType?: string;
-	/** Base64 image bytes without a `data:` prefix. */
-	imageData: string;
 }
 
 /** 工具拦截守卫看到的 pre 请求（只对 bash/read 生效，全量见 server/plugin-tool-guard.ts）。 */
@@ -208,6 +202,30 @@ export type ToolGuardPreDecision =
 	| { decision: "allow" }
 	| { decision: "deny"; reason?: string; reasonEn?: string }
 	| { decision: "ask"; reason?: string; reasonEn?: string };
+
+export interface PluginChatAttachment {
+	path?: string;
+	mode?: "reference" | "inline";
+	name?: string;
+	mimeType?: string;
+	imageData?: string;
+	fileData?: string;
+}
+
+export interface PluginChatRequest {
+	independent?: boolean;
+	text: string;
+	accountId?: string;
+	conversationId?: string;
+	/** Durable SDK session id used to disambiguate local conversation ids. */
+	sessionId?: string;
+	strictConversationId?: boolean;
+	cwd?: string;
+	model?: string;
+	thinkingLevel?: string;
+	/** Up to 8 attachments, 10 MiB each and 20 MiB total. Images use imageData (base64). */
+	attachments?: PluginChatAttachment[];
+}
 
 /** 插件服务端入口拿到的宿主接口（精简：全量见 server/plugins.ts PluginHost）。 */
 export interface PluginHost {
@@ -332,32 +350,16 @@ export interface PluginHost {
 	fetch(input: string | URL | Request, init?: RequestInit & { timeoutMs?: number }): Promise<Response>;
 	/** 无头调用：把外部通道文本投给 agent（要 "chat" 能力；宿主未接 chatProvider
 	 *  时 reject（由 chatWait 包成 {ok:false}，插件侧用 chatWait 更省心）。 */
-	chat(req: {
-		text: string;
-		accountId?: string;
-		cwd?: string;
-		conversationId?: string;
-		strictConversationId?: boolean;
-		model?: string;
-		thinkingLevel?: string;
-		attachments?: PluginChatAttachment[];
-	}): Promise<{
-		ok: boolean;
-		conversationId?: string;
-		error?: string;
+	chat(req: PluginChatRequest): Promise<{
+		ok?: boolean;
+		conversationId: string;
+		clientId: string;
+		sessionId?: string;
+		runId?: string;
 	}>;
 	/** 等待无头调用的运行结束（默认 120s 超时；无注入/超时/失败一律回 {ok:false}，绝不抛错）。 */
 	chatWait(
-		req: {
-			text: string;
-			accountId?: string;
-			cwd?: string;
-			conversationId?: string;
-			strictConversationId?: boolean;
-			model?: string;
-			thinkingLevel?: string;
-			attachments?: PluginChatAttachment[];
-		},
+		req: PluginChatRequest,
 		opts?: { timeoutMs?: number },
 	): Promise<{ ok: boolean; conversationId?: string; error?: string }>;
 	/** 对话读写：无注入时 list/search 回 []、get 回 null，绝不抛错。 */

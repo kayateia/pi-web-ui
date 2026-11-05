@@ -542,6 +542,8 @@ export { workspacePath };
  */
 export interface Conversation {
 	id: string;
+	/** Channel-owned conversation that must not be opened as a shared viewer. */
+	independent?: boolean;
 	/** Display title: first user prompt (truncated) or the default. */
 	title: string;
 	/** 这是子代理对话（左栏带「子代理」徽标；inMemory session，不进历史/resume）。 */
@@ -618,6 +620,10 @@ export interface Conversation {
 	 *  model-stall watchdog (#7): a run that produces no events at all for
 	 *  STALL_NOTIFY_MS is probably a half-open API connection. */
 	lastSdkEventAt: number;
+	/** Stable run token assigned by a channel plugin. Survives ownership transfer. */
+	pluginRunId?: string;
+	/** Run token waiting for agent_start; promoted only if the prompt actually starts. */
+	pendingPluginRunId?: string;
 	/** Agent 预设 id（standard/minimal/code/reader/ask；默认 standard）。 */
 	agentPreset?: string;
 	/** 预设已锁定（首轮用户发言后；空白会话可切换）。 */
@@ -3924,6 +3930,7 @@ export class ClientSession {
 			id,
 			title: conversationTitle(runtime.session),
 			isSubagent: false,
+			independent: this.readConversationIndependent(runtime.session),
 			runtime,
 			session: runtime.session,
 			cwd: restoreWorkspaceUriFromSessionDir(runtime.cwd),
@@ -3970,6 +3977,23 @@ export class ClientSession {
 		};
 		this.restorePlan(conv);
 		return conv;
+	}
+
+	private readConversationIndependent(session: AgentSession): boolean {
+		let independent = !isPseudoClientId(this.clientId ?? "") && !this.clientId?.startsWith("device-task-");
+		for (const entry of session.sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === "webui/independent")
+				independent = (entry.data as { independent?: boolean } | undefined)?.independent !== false;
+		}
+		return independent;
+	}
+
+	setConversationIndependent(id: string, independent: boolean): void {
+		const conv = this.convs.get(id);
+		if (!conv) return;
+		conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
+		conv.independent = independent;
+		this.emitConversations();
 	}
 
 	/** 会话计划回放恢复：持久化文件（sessionId）→ 转录 customType → 历史消息三重兜底。 */
@@ -4384,10 +4408,31 @@ export class ClientSession {
 	private emitRun(conv: Conversation, ev: Omit<PluginRunEvent, "conversationId" | "at">): void {
 		if (!this.onRunEvent) return;
 		try {
-			this.onRunEvent({ ...ev, conversationId: conv.id, at: Date.now() });
+			this.onRunEvent({
+				...ev,
+				conversationId: conv.id,
+				sessionId: conv.session.sessionId,
+				clientId: this.clientId,
+				...(conv.pluginRunId ? { runId: conv.pluginRunId } : {}),
+				at: Date.now(),
+			});
 		} catch (err) {
 			console.error("[agent-service] onRunEvent failed:", err);
 		}
+	}
+
+	/** Mark the current or next run as plugin-driven and return the conversation id. */
+	markPluginRun(runId: string, conv?: Conversation): string {
+		const target = conv ?? this.conv;
+		const id = String(runId ?? "").trim();
+		if (!target || !id) return target?.id ?? "";
+		try {
+			if (target.session.isStreaming) target.pluginRunId = id;
+			else target.pendingPluginRunId = id;
+		} catch {
+			target.pendingPluginRunId = id;
+		}
+		return target.id;
 	}
 
 	/** 当前打开对话变了 → 通知插件重拉（切历史会话/切 running 对话/新对话）。
@@ -4848,6 +4893,31 @@ export class ClientSession {
 		}
 	}
 
+	/** Resolve a stable plugin run token to its current conversation. */
+	findPluginRun(runId: string): Conversation | undefined {
+		if (!runId) return undefined;
+		return [...this.convs.values()].find((conv) => conv.pluginRunId === runId || conv.pendingPluginRunId === runId);
+	}
+
+	/** Abort a plugin run by stable token, safe across conversation transfer. */
+	async abortPluginRun(runId: string): Promise<{ ok: boolean; error?: string }> {
+		const conv = this.findPluginRun(runId);
+		if (!conv) return { ok: false, error: `Unknown plugin run: ${runId}` };
+		try {
+			await this.interruptRun(conv, "插件已中止运行");
+			this.flushSnapshot();
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: (err as Error).message };
+		}
+	}
+
+	/** Return a conversation held by this client, if any. */
+	getConversation(id: string): Conversation | undefined {
+		const key = String(id ?? "").trim();
+		return key ? this.convs.get(key) : undefined;
+	}
+
 	/** 插件扩展点（供 runSteerer 跨客户端兜底复用）：只在本客户端 conversations 里找对话，
 	 *  持有则执行 steer 并返回结果，未持有回 undefined（不碰钩子，无递归）。 */
 	async steerOwnConversation(id: string, text: string): Promise<{ ok: boolean; error?: string } | undefined> {
@@ -5276,6 +5346,8 @@ export class ClientSession {
 						conv,
 						lastAssistant?.stopReason ? { type: "run_end", stopReason: lastAssistant.stopReason } : { type: "run_end" },
 					);
+					conv.pluginRunId = undefined;
+					conv.pendingPluginRunId = undefined;
 				} catch {
 					/* 轨迹尽力而为 */
 				}
@@ -5489,6 +5561,10 @@ export class ClientSession {
 			case "agent_start": {
 				// 本轮已正式进入流式（session.isStreaming=true），清除首轮启动期投递标记（#589）。
 				conv.promptInFlight = false;
+				if (conv.pendingPluginRunId) {
+					conv.pluginRunId = conv.pendingPluginRunId;
+					conv.pendingPluginRunId = undefined;
+				}
 				// 轨迹事件：新一轮开始（任务文本由 prompt() 暂存；steer/内部续跑
 				// 无暂存时省略，插件回退为「继续执行」）。
 				const task = conv.pendingTask;
@@ -9427,12 +9503,16 @@ export class ClientSession {
 		 * after the current turn settles, skipping remaining planned tool calls.
 		 */
 		queue = false,
+		targetConversation?: Conversation,
 	): Promise<void> {
 		// Captured at the START (before any await): the conversation being
 		// addressed by this prompt. See the naming block below — a concurrent
 		// switch/new_chat while prompt() is in flight must never target a
 		// different conversation.
-		const conv = this.conv;
+		const conv = targetConversation ?? this.conv;
+		if (targetConversation && this.convs.get(conv.id) !== conv) {
+			throw new Error("Prompt conversation is no longer available");
+		}
 		// 人类用户发送新消息，重置自主轮次与空转计数器（issue #726）
 		conv.autonomousTurnsWithoutUser = 0;
 		conv.consecutiveIdleWakeTurns = 0;
