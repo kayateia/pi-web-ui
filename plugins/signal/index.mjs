@@ -868,6 +868,7 @@ export class SignalGateway {
 		this.sessionMap[parsed.key] = {
 			generation,
 			conversationId: result.conversationId,
+			...(result.sessionId ? { sessionId: result.sessionId } : {}),
 			...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
 			updatedAt: Date.now(),
 		};
@@ -958,6 +959,7 @@ export class SignalGateway {
 			}`;
 			pending = {
 				conversationId,
+				runId: "",
 				parsed,
 				expectedTask: promptText,
 				text: "",
@@ -965,8 +967,8 @@ export class SignalGateway {
 			};
 			this.pendingRuns.set(conversationId, pending);
 			pending.timeout = setTimeout(() => {
-				if (this.pendingRuns.get(conversationId) !== pending) return;
-				this.pendingRuns.delete(conversationId);
+				if (![...this.pendingRuns.values()].includes(pending)) return;
+				this.deletePendingRun(pending);
 				void this.unreact(parsed)
 					.then(() => this.react(parsed, "❌"))
 					.catch(() => {});
@@ -977,6 +979,7 @@ export class SignalGateway {
 				text: promptText,
 				accountId: senderAccountId(parsed.sender.channelIds[0] || parsed.key),
 				conversationId,
+				...(binding.sessionId ? { sessionId: binding.sessionId } : {}),
 				strictConversationId: true,
 				...(images.length > 0
 					? {
@@ -992,9 +995,18 @@ export class SignalGateway {
 				...(channelConfig.thinkingLevel ? { thinkingLevel: channelConfig.thinkingLevel } : {}),
 			});
 			if (!result?.conversationId) throw new Error("Signal prompt 未被 pi-web-ui 接收");
+			if (result.runId) this.bindPendingRun(pending, result.runId);
+			if (result.sessionId) {
+				const saved = this.sessionMap[parsed.key];
+				if (saved) {
+					saved.sessionId = result.sessionId;
+					saved.conversationId = result.conversationId;
+					await this.setSessionMap(this.sessionMap);
+				}
+			}
 		} catch (error) {
 			if (pending?.timeout) clearTimeout(pending.timeout);
-			if (pending) this.pendingRuns.delete(pending.conversationId);
+			if (pending) this.deletePendingRun(pending);
 			await this.unreact(parsed)
 				.then(() => this.react(parsed, "❌"))
 				.catch(() => {});
@@ -1002,16 +1014,34 @@ export class SignalGateway {
 		}
 	}
 
-	handleRunEvent(event) {
+	deletePendingRun(pending) {
+		for (const [key, value] of this.pendingRuns) if (value === pending) this.pendingRuns.delete(key);
+	}
+
+	bindPendingRun(pending, runId) {
+		if (![...this.pendingRuns.values()].includes(pending)) return;
+		pending.runId = runId;
+		this.pendingRuns.delete(pending.conversationId);
+		this.pendingRuns.set(`run:${runId}`, pending);
+	}
+
+	pendingRunFor(event) {
+		const runId = String(event?.runId ?? "");
 		const conversationId = String(event?.conversationId ?? "");
-		if (!conversationId) return;
-		const pending = this.pendingRuns.get(conversationId);
+		return (
+			(runId ? this.pendingRuns.get(`run:${runId}`) : undefined) ||
+			(conversationId ? this.pendingRuns.get(conversationId) : undefined)
+		);
+	}
+
+	handleRunEvent(event) {
+		const pending = this.pendingRunFor(event);
 		if (!pending) return;
 
 		if (event.type === "run_start") {
 			if (event.task && event.task !== pending.expectedTask) {
 				if (pending.timeout) clearTimeout(pending.timeout);
-				this.pendingRuns.delete(conversationId);
+				this.deletePendingRun(pending);
 			}
 			return;
 		}
@@ -1034,7 +1064,7 @@ export class SignalGateway {
 		if (event.type !== "run_end") return;
 
 		if (pending.timeout) clearTimeout(pending.timeout);
-		this.pendingRuns.delete(conversationId);
+		this.deletePendingRun(pending);
 		void this.finishRun(pending, event.stopReason);
 	}
 

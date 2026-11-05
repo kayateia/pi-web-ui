@@ -403,6 +403,45 @@ describe("Signal delivery helpers", () => {
 		expect(gateway.pendingRuns.has("c1")).toBe(false);
 	});
 
+	it("claims takeover-safe events by stable runId instead of local conversation id", async () => {
+		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
+		const gateway = new SignalGateway({
+			host: {},
+			getConfig: () => normalizeConfig({ allowedSenders: [`aci:${aliceUuid}`] }),
+		});
+		gateway.status.account = account;
+		const sent: string[] = [];
+		gateway.sendText = async (_channel, text) => {
+			sent.push(text);
+		};
+		gateway.react = async () => {};
+		gateway.unreact = async () => {};
+		const pending = {
+			conversationId: "c1",
+			runId: "",
+			parsed,
+			expectedTask: "hello",
+			text: "",
+			timeout: null,
+		};
+		gateway.pendingRuns.set("c1", pending);
+		gateway.bindPendingRun(pending, "pr-stable");
+		expect(gateway.pendingRuns.has("c1")).toBe(false);
+		expect(gateway.pendingRuns.has("run:pr-stable")).toBe(true);
+
+		gateway.handleRunEvent({ type: "run_start", conversationId: "renamed", runId: "pr-stable", task: "hello" });
+		gateway.handleRunEvent({
+			type: "message",
+			conversationId: "renamed-again",
+			runId: "pr-stable",
+			message: { role: "assistant", content: "reply" },
+		});
+		gateway.handleRunEvent({ type: "run_end", conversationId: "final-id", runId: "pr-stable" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(sent).toEqual(["reply"]);
+		expect(gateway.pendingRuns.size).toBe(0);
+	});
+
 	it("passes the composed global + channel prompt as an append layer", async () => {
 		const parsed = parseSignalEnvelope(directEnvelope(), { account, accountUuid })!;
 		const config = normalizeConfig({
@@ -459,7 +498,7 @@ describe("Signal delivery helpers", () => {
 		const gateway = new SignalGateway({
 			host: {
 				conversations: {
-					ensure: async () => ({ ok: true, conversationId: "c1" }),
+					ensure: async () => ({ ok: true, conversationId: "c1", sessionId: "sdk-signal-session" }),
 				},
 				chat: async (request: Record<string, unknown>) => {
 					chatRequest = request;
@@ -486,6 +525,7 @@ describe("Signal delivery helpers", () => {
 		gateway.pendingRuns.clear();
 		expect(chatRequest).toMatchObject({
 			conversationId: "c1",
+			sessionId: "sdk-signal-session",
 			strictConversationId: true,
 			attachments: [
 				{

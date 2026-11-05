@@ -7,6 +7,10 @@ signal-cli's `getAttachment` RPC and forwarded as normal pi-web-ui image content
 Signal `@mentions` are resolved against known contacts and rendered as readable
 `@Display Name` text in the conversation.
 
+Channel runs are claimed by the host's stable `runId`, so replies survive
+conversation takeover and local ID changes. Bound conversations also carry their
+durable SDK `sessionId` to avoid ambiguous IDs after a restart.
+
 ## Requirements
 
 - linked signal-cli account with `signal-cli daemon --http 127.0.0.1:8080`
