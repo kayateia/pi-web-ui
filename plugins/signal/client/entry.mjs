@@ -224,6 +224,10 @@ export default {
 				["Blocked", String(status.messagesBlocked || 0)],
 				["Active channel queues", String((status.activeChannels || []).length)],
 				["Configured channels", String(status.configuredChannels || 0)],
+				["SSE reconnects", String(status.sseReconnects || 0)],
+				["Last SSE data", status.lastSseDataAt ? new Date(status.lastSseDataAt).toLocaleTimeString() : "(none yet)"],
+				["Daemon PID", status.daemonPid ? String(status.daemonPid) : "(not owned)"],
+				["Daemon restarts", String(status.daemonRestartAttempts || 0)],
 				["Last error", status.lastError || "none"],
 			];
 			for (const [label, value] of rows) {
@@ -256,6 +260,13 @@ export default {
 			state = (await send("get_state")) || {};
 			fill(state.config || {});
 			renderStatus(state.status || {});
+		}
+
+		async function refreshStatus() {
+			const next = await send("get_state");
+			if (!next) return;
+			state = next;
+			renderStatus(next.status || {});
 		}
 
 		q(".signal-save").addEventListener("click", async () => {
@@ -300,7 +311,12 @@ export default {
 		});
 
 		await refresh();
+		const statusTimer = setInterval(() => {
+			if (document.visibilityState === "hidden") return;
+			void refreshStatus().catch(() => {});
+		}, 5_000);
 		return () => {
+			clearInterval(statusTimer);
 			offData?.();
 			for (const waiter of pending.values()) {
 				clearTimeout(waiter.timer);

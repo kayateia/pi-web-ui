@@ -20,6 +20,14 @@ By default the plugin owns the daemon lifecycle: enabling the gateway starts
 `signal-cli -a <account> daemon --http <loopback-url>`, and disabling the
 gateway or unloading the plugin terminates that child process. Select
 **External / systemd** instead when another supervisor already owns the daemon.
+Owned daemon failures are retried with bounded exponential backoff. Runtime
+stdout/stderr is retained only in a small in-memory tail and is attached to
+startup/crash errors for diagnosis.
+
+The receive SSE stream has a two-minute inactivity watchdog. If signal-cli
+leaves the HTTP connection open but stops streaming events, the gateway closes
+it and reconnects using exponential backoff. Reconnect counts and the last SSE
+data timestamp are exposed in the status response.
 
 The account setup and systemd daemon used by the existing pi-signal integration
 are documented at <https://github.com/aalzubidy/pi-signal>.
