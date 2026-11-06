@@ -1114,8 +1114,6 @@ export class SignalGateway {
 						}
 					: {}),
 				...(channelConfig.workspace ? { cwd: channelConfig.workspace } : {}),
-				...(channelConfig.model ? { model: channelConfig.model } : {}),
-				...(channelConfig.thinkingLevel ? { thinkingLevel: channelConfig.thinkingLevel } : {}),
 			});
 			if (!result?.conversationId) throw new Error("Signal prompt 未被 pi-web-ui 接收");
 			if (result.runId) this.bindPendingRun(pending, result.runId);

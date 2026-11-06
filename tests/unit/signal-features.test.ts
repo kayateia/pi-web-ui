@@ -546,14 +546,22 @@ describe("Signal delivery helpers", () => {
 		const parsed = parseSignalEnvelope(raw, { account, accountUuid })!;
 		const config = normalizeConfig({
 			allowedSenders: [`aci:${aliceUuid}`],
+			defaults: {
+				model: "test/model",
+				thinkingLevel: "high",
+			},
 			channels: { [parsed.key]: { enabled: true } },
 		});
 		const profile = resolveChannelProfile(parsed, config)!;
+		let ensureRequest: Record<string, unknown> | undefined;
 		let chatRequest: Record<string, unknown> | undefined;
 		const gateway = new SignalGateway({
 			host: {
 				conversations: {
-					ensure: async () => ({ ok: true, conversationId: "c1", sessionId: "sdk-signal-session" }),
+					ensure: async (request: Record<string, unknown>) => {
+						ensureRequest = request;
+						return { ok: true, conversationId: "c1", sessionId: "sdk-signal-session" };
+					},
 				},
 				chat: async (request: Record<string, unknown>) => {
 					chatRequest = request;
@@ -590,6 +598,9 @@ describe("Signal delivery helpers", () => {
 				},
 			],
 		});
+		expect(ensureRequest).toMatchObject({ model: "test/model", thinkingLevel: "high" });
+		expect(chatRequest).not.toHaveProperty("model");
+		expect(chatRequest).not.toHaveProperty("thinkingLevel");
 		expect(String(chatRequest?.text)).toContain("1 image attachment");
 	});
 });
