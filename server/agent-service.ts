@@ -3801,7 +3801,15 @@ export class ClientSession {
 		clientId: string,
 		cwd: string,
 		stateStore: ClientStateStore,
-		opts?: { blank?: boolean; blankTitle?: string; idleHeld?: boolean },
+		opts?: {
+			blank?: boolean;
+			blankTitle?: string;
+			idleHeld?: boolean;
+			/** Cross-client ownership probe for pinned restores (issue #145
+			 *  parity): true = another client already holds that transcript, so
+			 *  reopening it here would create a second writer. */
+			isSessionHeldElsewhere?: (sessionPath: string) => boolean;
+		},
 	): Promise<ClientSession> {
 		const botExecution = getBotExecution(clientId);
 		botExecution?.assertActive();
@@ -3906,7 +3914,10 @@ export class ClientSession {
 		}
 
 		// 恢复本项目其他已被钉住的会话（重启后常驻运行列表，issue #433）
-		const pinnedPaths = botExecution ? [] : (cs.stateStore?.getPinnedSessions(cwd) ?? []);
+		// Pseudo clients (plugins/scheduler/canvas) never restore project history —
+		// that includes pinned transcripts, which otherwise opened in every
+		// headless client after a restart.
+		const pinnedPaths = botExecution || isPseudoClientId(clientId) ? [] : (cs.stateStore?.getPinnedSessions(cwd) ?? []);
 		const maxOpenConversations = getMaxOpenConversations();
 		for (const p of pinnedPaths) {
 			if (cs.convs.size >= maxOpenConversations) break;
@@ -3918,6 +3929,11 @@ export class ClientSession {
 			try {
 				const targetPath = resolve(p);
 				if (!existsSync(targetPath)) continue;
+				// issue #145 applies to pinned sessions too: a transcript another
+				// client still holds must not get a second writer (pinning the same
+				// conversation in two tabs used to fork the history). The running
+				// list already offers it as "elsewhere" for takeover.
+				if (opts?.isSessionHeldElsewhere?.(targetPath)) continue;
 				cs.repairTranscriptFileBeforeOpen(targetPath);
 				const sm = SessionManager.open(targetPath);
 				const convId = cs.nextConversationId();
@@ -5889,6 +5905,22 @@ export class ClientSession {
 	getConversation(id: string): Conversation | undefined {
 		const key = String(id ?? "").trim();
 		return key ? this.convs.get(key) : undefined;
+	}
+
+	/** Resolve an open conversation by durable SDK session id. Channel bindings
+	 *  use it after a takeover renamed the local conversation id: the session id
+	 *  is the identity that survives. */
+	findConversationBySessionId(sessionId: string): Conversation | undefined {
+		const key = String(sessionId ?? "").trim();
+		if (!key) return undefined;
+		for (const conv of this.convs.values()) {
+			try {
+				if (String(conv.session.sessionId ?? "") === key) return conv;
+			} catch {
+				// session being replaced — skip
+			}
+		}
+		return undefined;
 	}
 
 	/** issue #231：本客户端内按稳定键定位调度唤醒目标。

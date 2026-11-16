@@ -2676,12 +2676,6 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 	type PluginSearchClient = {
 		searchForPlugins?: (q: string, n?: number) => Promise<{ id: string; title: string }[]>;
 	};
-	type PluginEnsureClient = {
-		ensureConversationForPlugins?: (
-			pluginId: string,
-			spec: import("./plugins.js").PluginConversationEnsureRequest,
-		) => Promise<import("./plugins.js").PluginConversationEnsureResult>;
-	};
 	type PluginWriteClient = {
 		writeForPlugins?: (cid: string, t: string) => Promise<{ ok: boolean; error?: string }>;
 	};
@@ -2726,17 +2720,19 @@ pluginMgr.onBgTasksChanged = () => service.refreshBackgroundServers();
 		}
 	};
 	// conversationEnsurer：创建/复用不带焦点的后台对话。Signal 等外部通道用稳定
-	// channel key 绑定普通 pi-web-ui 对话，并可按通道配置系统提示词。
+	// channel key 绑定普通 pi-web-ui 对话，并可按通道配置系统提示词。宿主按
+	// sessionFile 选稳定归属（已打开它的客户端，否则每插件一个伪客户端），
+	// 不再随手挑当前最活跃的客户端会话。
 	(pm as any).conversationEnsurer = async (
 		pluginId: string,
 		spec: import("./plugins.js").PluginConversationEnsureRequest,
 	) => {
 		try {
-			const cs = pickClient() as PluginEnsureClient | undefined;
-			if (!cs || typeof cs.ensureConversationForPlugins !== "function") {
+			const svc = piServiceInstance;
+			if (!svc || typeof svc.ensurePluginConversation !== "function") {
 				return { ok: false, error: "当前引擎不支持创建插件对话（仅标准 pi 引擎）" };
 			}
-			return await cs.ensureConversationForPlugins(pluginId, spec);
+			return await svc.ensurePluginConversation(pluginId, spec);
 		} catch (err) {
 			return { ok: false, error: (err as Error).message };
 		}
