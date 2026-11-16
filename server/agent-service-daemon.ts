@@ -56,6 +56,8 @@ import type {
 	PluginChatRequest,
 	PluginChatAttachment,
 	PluginChatResult,
+	PluginConversationEnsureRequest,
+	PluginConversationEnsureResult,
 } from "./plugins.js";
 import type { SchedulerStore } from "./scheduler-tasks.js";
 import {
@@ -1095,25 +1097,65 @@ export class AgentService {
 		// miss/已回收时不抛错，回落无头伪客户端（浏览器关着时微信照常可用）。
 		const target = String(req?.conversationId ?? "").trim();
 		if (target) {
-			// Conversation ids are local to a client. Prefer this channel's own
-			// client. The durable SDK session id disambiguates restored clients
-			// whose local counters reuse the same conversation id.
+			// Conversation ids are local to a client: every ClientSession counts
+			// from c1, and several clients can legitimately hold the SAME durable
+			// session (restored tabs, pinned conversations, channel conversations
+			// taken over for viewing). Resolve by the SDK session id first — that
+			// is the cross-client identity — and only fall back to the local id for
+			// legacy bindings saved before ensure() returned a session id.
+			type PluginChatHit = { owner: ClientSession; conv: Conversation; ownerId: string };
 			const targetSessionId = String(req?.sessionId ?? "").trim();
-			const matchesTarget = (conv: Conversation) =>
-				!targetSessionId || String(conv.session.sessionId ?? "") === targetSessionId;
-			const own = this.clients.get(clientId);
-			const ownConv = own?.getConversation(target);
-			const hits: { owner: ClientSession; conv: Conversation; ownerId: string }[] = [];
-			if (own && ownConv && matchesTarget(ownConv)) hits.push({ owner: own, conv: ownConv, ownerId: clientId });
-			else {
+			const collectByLocalId = (conversationId: string, accept?: (conv: Conversation) => boolean): PluginChatHit[] => {
+				const out: PluginChatHit[] = [];
 				for (const [ownerId, owner] of this.clients) {
-					const conv = owner.getConversation(target);
-					if (conv && matchesTarget(conv)) hits.push({ owner, conv, ownerId });
+					const conv = owner.getConversation(conversationId);
+					if (conv && (!accept || accept(conv))) out.push({ owner, conv, ownerId });
 				}
+				return out;
+			};
+			let hits: PluginChatHit[] = [];
+			let ambiguous = false;
+			if (targetSessionId) {
+				// Scan every open conversation, not just the recorded local id:
+				// takeovers rename conversations, and the session id is what
+				// survived. Two clients holding the same session are one
+				// conversation, not an ambiguity.
+				for (const [ownerId, owner] of this.clients) {
+					const conv =
+						typeof owner.findConversationBySessionId === "function"
+							? owner.findConversationBySessionId(targetSessionId)
+							: (() => {
+									// Older/foreign client shape: only trust an id hit whose session matches.
+									const candidate = owner.getConversation(target);
+									return candidate && String(candidate.session.sessionId ?? "") === targetSessionId
+										? candidate
+										: undefined;
+								})();
+					if (conv) hits.push({ owner, conv, ownerId });
+				}
+				if (hits.length === 0) {
+					// No live copy of that session (stale binding / forked transcript):
+					// fall back to the local id. Several different sessions sharing a
+					// local id are still a real ambiguity.
+					hits = collectByLocalId(target);
+					ambiguous = hits.length > 1;
+				}
+			} else {
+				// Legacy binding without a session id: prefer this channel's own
+				// client, otherwise any single owner.
+				const own = this.clients.get(clientId);
+				const ownConv = own?.getConversation(target);
+				hits = own && ownConv ? [{ owner: own, conv: ownConv, ownerId: clientId }] : collectByLocalId(target);
+				ambiguous = hits.length > 1;
 			}
-			if (hits.length > 1) throw new Error("chatFromPlugin: ambiguous conversation id; rebind the channel");
-			if (hits.length === 1) {
-				const { owner, conv, ownerId } = hits[0];
+			if (ambiguous) throw new Error("chatFromPlugin: ambiguous conversation id; rebind the channel");
+			if (hits.length > 0) {
+				const hit = hits.length === 1 ? hits[0] : this.pickPluginConversationOwner(hits, target, clientId);
+				if (hits.length > 1)
+					console.warn(
+						`[plugin chat] ${hits.length} clients hold session ${String(targetSessionId || hit.conv.session.sessionId)}; delivering through ${hit.ownerId}/${hit.conv.id} (${hits.map((entry) => entry.ownerId).join(", ")})`,
+					);
+				const { owner, conv, ownerId } = hit;
 				if (req.cwd && resolve(req.cwd) !== resolve(conv.cwd))
 					throw new Error("chatFromPlugin: bound conversation cwd differs; start a new channel conversation");
 				if (req.model || req.thinkingLevel) {
@@ -1177,6 +1219,60 @@ export class AgentService {
 		const conv = cs.getConversation(conversationId);
 		void cs.prompt(text, attachments, false, conv).catch((err) => console.error("[plugin chat] prompt failed", err));
 		return { conversationId, clientId, sessionId: conv?.session.sessionId, runId };
+	}
+
+	/** One conversation, several clients: restored tabs, pinned sessions and
+	 *  channel conversations opened for viewing can all hold the same durable
+	 *  session. That is not an ambiguity — pick one writer deterministically so
+	 *  every message lands in the same transcript. Prefer the recorded local id,
+	 *  then a real browser over a headless pseudo client (the user can watch the
+	 *  run), then this channel's own client, with the client id as a stable
+	 *  tie-break. */
+	private pickPluginConversationOwner(
+		hits: { owner: ClientSession; conv: Conversation; ownerId: string }[],
+		targetId: string,
+		ownClientId: string,
+	): { owner: ClientSession; conv: Conversation; ownerId: string } {
+		const score = (hit: { conv: Conversation; ownerId: string }): number =>
+			(hit.conv.id === targetId ? 4 : 0) +
+			(isPseudoClientId(hit.ownerId) ? 0 : 2) +
+			(hit.ownerId === ownClientId ? 1 : 0);
+		return [...hits].sort(
+			(a, b) => score(b) - score(a) || (a.ownerId < b.ownerId ? -1 : a.ownerId > b.ownerId ? 1 : 0),
+		)[0];
+	}
+
+	/** Ensure a transport plugin's channel conversation in a stable home.
+	 *
+	 *  Channel conversations used to be created in whichever client
+	 *  pluginClient() happened to return, so a channel's conversation could hop
+	 *  between browser tabs and headless clients across restarts — and a second
+	 *  copy of the same transcript could be opened next to the live one. Reopen
+	 *  requests now go to the client that already holds the session file (one
+	 *  writer stays one writer); everything else is hosted in a per-plugin
+	 *  pseudo client that is never adopted as a browser tab and never restores
+	 *  project history. */
+	async ensurePluginConversation(
+		pluginId: string,
+		request: PluginConversationEnsureRequest,
+	): Promise<PluginConversationEnsureResult> {
+		const safe = String(pluginId ?? "plugin").replace(/[^A-Za-z0-9_-]/g, "") || "plugin";
+		const requestedFile = String(request?.sessionFile ?? "").trim();
+		if (requestedFile) {
+			let abs = "";
+			try {
+				abs = resolve(requestedFile);
+			} catch {
+				abs = "";
+			}
+			const owner = abs ? this.findSessionOwner(abs, "") : null;
+			const ownerSession = owner ? this.clients.get(owner.clientId) : undefined;
+			if (ownerSession && typeof ownerSession.ensureConversationForPlugins === "function") {
+				return await ownerSession.ensureConversationForPlugins(safe, request);
+			}
+		}
+		const cs = await this.attach(`plugin:${safe}:channels`, () => {});
+		return await cs.ensureConversationForPlugins(safe, request);
 	}
 
 	/** Abort by the stable plugin run token, including after conversation takeover. */
@@ -1744,7 +1840,14 @@ export class AgentService {
 					// （跑着或空闲），建之前就决定空白（第二个 writer 根本不会被打开，
 					// 也无需事后拆 runtime）。之前只拦 running：空闲持有照样恢复出双
 					// writer，两边轮流发送分叉历史。其他客户端不存在时不扫目录。
-					let createOpts: { blank?: boolean; blankTitle?: string; idleHeld?: boolean } | undefined;
+					let createOpts:
+						| {
+								blank?: boolean;
+								blankTitle?: string;
+								idleHeld?: boolean;
+								isSessionHeldElsewhere?: (sessionPath: string) => boolean;
+						  }
+						| undefined;
 					const requiresBlankSession = isOrphanAdoptionExcludedClientId(clientId);
 					if (requiresBlankSession) {
 						// 伪客户端（插件、调度、Canvas、Bot）：禁止自动恢复工作区历史或旧任务，强制空白
@@ -1761,6 +1864,16 @@ export class AgentService {
 						} catch {
 							// 列表失败不挡正常恢复
 						}
+					}
+					// Pinned sessions restore inside ClientSession.create; hand it the
+					// cross-client ownership probe so a second client never opens a
+					// transcript another one already holds (issue #145 parity). Headless
+					// pseudo clients never restore project history, so they don't need it.
+					if (!requiresBlankSession) {
+						createOpts = {
+							...createOpts,
+							isSessionHeldElsewhere: (sessionPath) => Boolean(this.findSessionOwner(resolve(sessionPath), clientId)),
+						};
 					}
 					const creating = ClientSession.create(clientId, cwd, this.stateStore, createOpts).finally(() => {
 						this.pending.delete(clientId);
