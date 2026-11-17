@@ -899,8 +899,14 @@ export class AgentService {
 				if (normFile && localFiles.has(normFile)) continue;
 				if (rest.independent !== false && localCwdTitles.has(`${rest.cwd}\0${rest.title}`)) continue;
 
+				// 分类存在共享状态里（按 sessionId / 落盘路径），不依赖持有方实时刷新：
+				// 浏览器给无头频道会话改分类后，下一次 elsewhere 快照就能读到新值。
+				const categoryId = rest.sessionFile
+					? this.stateStore?.getConversationCategoryId(undefined, rest.sessionFile)
+					: undefined;
 				const entry: ElsewhereRunning = {
 					...rest,
+					...(categoryId ? { categoryId } : {}),
 					owner: clientId,
 					...(isPseudo ? { pseudo: true as const } : {}),
 					...(offline ? { ownerOffline: true as const } : {}),

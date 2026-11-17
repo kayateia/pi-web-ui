@@ -3174,6 +3174,9 @@ export interface ElsewhereRunning {
 	isStreaming: boolean;
 	/** 落盘会话文件（有则前端可直接按路径打开；缺省 = inMemory/未知）。 */
 	sessionFile?: string;
+	/** 该会话的话题分类（按落盘路径共享；缺省 = 未分类）。
+	 *  无头插件的频道会话也能像普通运行对话一样归入分类。 */
+	categoryId?: string;
 	/** Owning client id (takeover target's holder). Absent = 不可过户. */
 	owner?: string;
 	/** Conversation id inside the owning client (takeover target). */

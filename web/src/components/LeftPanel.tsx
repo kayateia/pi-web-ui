@@ -166,6 +166,10 @@ type SessionMenuTarget = {
 	label: string;
 	owner?: string;
 	pseudo?: boolean;
+	/** 「另一处」行的落盘文件：按路径持久化的操作（分类等）用它定位。 */
+	sessionFile?: string;
+	/** 「另一处」行当前所属分类（菜单里给当前项打禁用标记）。 */
+	categoryId?: string;
 };
 
 /** 右键落点是不是「输入类」元素：重命名输入框里的右键要留给浏览器（复制 / 粘贴 /
@@ -561,14 +565,20 @@ export const LeftPanel = memo(function LeftPanel({
 						: { ...entry, hidden: true };
 				return entry;
 			});
+			// 「另一处」行没有本机 conv 对象，靠落盘路径落到共享分类表；无文件的
+			// （inMemory / 未知）行无法稳定定位，就不提供分类菜单。
+			const elsewhereCategoryPath = target.kind === "elsewhere" ? target.sessionFile : undefined;
+			const categoryTargetPath = target.kind === "history" ? target.id : elsewhereCategoryPath;
 			const targetCategoryId =
 				target.kind === "running"
 					? conversations.find((conversation) => conversation.id === scopeId)?.categoryId
 					: target.kind === "history"
 						? sessions.find((session) => session.path === target.id)?.categoryId
-						: undefined;
+						: target.kind === "elsewhere"
+							? target.categoryId
+							: undefined;
 			const categoryEntries: UiSlotEntry[] =
-				conversationCategories.length > 0 && (target.kind === "running" || target.kind === "history")
+				conversationCategories.length > 0 && (target.kind === "running" || Boolean(categoryTargetPath))
 					? [
 							{
 								id: "host:conv-category:none",
@@ -660,6 +670,8 @@ export const LeftPanel = memo(function LeftPanel({
 					panelSend({ type: "set_conversation_category", conversationId: scopeId, categoryId });
 				} else if (target.kind === "history") {
 					panelSend({ type: "set_conversation_category", path: target.id, categoryId });
+				} else if (target.kind === "elsewhere" && target.sessionFile) {
+					panelSend({ type: "set_conversation_category", path: target.sessionFile, categoryId });
 				}
 				return;
 			}
@@ -906,6 +918,7 @@ export const LeftPanel = memo(function LeftPanel({
 				ownerOffline: Boolean(w.ownerOffline),
 				sessionFile: w.sessionFile,
 				// 过户目标定位（无则沿用旧行为：只读行，无过户入口）。
+				...(w.categoryId ? { categoryId: w.categoryId } : {}),
 				...(w.owner && w.convId ? { owner: w.owner, convId: w.convId } : {}),
 				...(w.hasQuestion ? { hasQuestion: true as const } : {}),
 			});
@@ -1477,6 +1490,8 @@ export const LeftPanel = memo(function LeftPanel({
 																						label: c.title,
 																						...(elseOwner ? { owner: elseOwner } : {}),
 																						...(isPseudo ? { pseudo: true } : {}),
+																						...(c.sessionFile ? { sessionFile: c.sessionFile } : {}),
+																						...(c.categoryId ? { categoryId: c.categoryId } : {}),
 																					})
 																				}
 																			>
@@ -1577,6 +1592,8 @@ export const LeftPanel = memo(function LeftPanel({
 																								label: c.title,
 																								...(elseOwner ? { owner: elseOwner } : {}),
 																								...(isPseudo ? { pseudo: true } : {}),
+																								...(c.sessionFile ? { sessionFile: c.sessionFile } : {}),
+																								...(c.categoryId ? { categoryId: c.categoryId } : {}),
 																							});
 																						}}
 																					>
