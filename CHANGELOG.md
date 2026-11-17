@@ -17,12 +17,15 @@
 ### Fixed
 
 - **通道插件会话绑定（Signal / Matrix 等）**：同一个会话被多个客户端（恢复的标签页、钉住的对话、无头伪客户端）同时打开时，`host.chat` 不再误报 `ambiguous conversation id` 并把消息丢掉 —— 改为按 SDK sessionId 定位，并在多个持有方里确定性地选一个投递（优先记下的本地会话 id，其次真实浏览器，再次通道自己的伪客户端）。通道对话的归属也改为按会话文件固定：已打开该文件的客户端继续持有，否则落到每插件一个伪客户端，不再随 `pluginClient()` 在浏览器标签页之间漂移。钉住会话的恢复补上跨客户端单写者检查，伪客户端也不再恢复钉住的会话。
+- **无头频道会话也能归入分类**：`plugin:*` 伪客户端持有的通道会话在左栏是只读的「另一处」行，之前没有分类菜单。现在「另一处」行会带上会话文件对应的分类，右键或行尾菜单可像普通运行对话一样移入 / 移出分类；分类按落盘路径写入共享状态，Signal / Matrix 的频道会话重启后仍然保留。协议版本同步为 42。
 
 <!-- auto-i18n:start -->
+
 ### i18n
 
 - 前端新增 key（16）：`leftPanelGroups`、`questionAutoSubmitLast`、`questionPickSubmits`、`worktreeViewTitle`、`worktreeEntryTip`、`worktreeBackToChat`、`worktreeRefresh`、`worktreeViewHint`、`worktreeEmpty`、`worktreeDetached`、`worktreeCurrent`、`worktreeMain`、`worktreeHasChanges`、`worktreeClean`、`worktreeSwitch`、`worktreeManage`
 - 前端删除 key（12）：`worktreeBannerActiveTitle`、`worktreeBannerActiveDesc`、`worktreeBannerUncleanedTitle`、`worktreeBannerUncleanedDesc`、`worktreeActionSwitchMainTip`、`worktreeActionSwitchTo`、`worktreeActionSwitchToTip`、`worktreeActionRemoveTip`、`worktreeActionCollapse`、`worktreeActionMore`、`worktreeActionDismiss`、`worktreeActionDismissTip`
+
 <!-- auto-i18n:end -->
 
 ## [0.114.3] — 2026-10-31
